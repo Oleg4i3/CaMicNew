@@ -1,0 +1,32 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.simplecam'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.simplecam"
+        minSdk 26        // Android 8.0 — Camera2 + MediaCodec surface mode
+        targetSdk 34
+        versionCode 2
+        versionName "1.1.0"
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    // Debug-сборка автоматически подписывается дефолтным debug-ключом Android —
+    // такой APK готов к установке через "Неизвестные источники" без каких-либо
+    // дополнительных действий.
+    buildTypes {
+        debug {
+            // applicationIdSuffix убран — один пакет, удобнее устанавливать
+        }
+    }
+}
+
+// Внешних зависимостей нет: только AOSP Camera2 / MediaCodec API
