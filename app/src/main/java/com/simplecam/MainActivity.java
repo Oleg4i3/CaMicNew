@@ -201,9 +201,10 @@ root.addView(mSv, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARE
 
 mMonitorView = new SurfaceView(this);
 mMonitorView.setZOrderMediaOverlay(true);
+mMonitorView.setBackgroundColor(Color.RED);
 FrameLayout.LayoutParams monLP = new FrameLayout.LayoutParams(dp(110), dp(80));
 monLP.gravity = Gravity.TOP | Gravity.RIGHT;
-monLP.topMargin = dp(10); monLP.rightMargin = dp(10);
+monLP.topMargin = dp(50); monLP.rightMargin = dp(50);
 root.addView(mMonitorView, monLP);
 mMonitorHolder = mMonitorView.getHolder();
 mMonitorHolder.addCallback(new SurfaceHolder.Callback() {
