@@ -28,6 +28,11 @@ import android.media.audiofx.AutomaticGainControl;
 import android.media.audiofx.NoiseSuppressor;
 import android.media.audiofx.AcousticEchoCanceler;
 
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
+
 import java.io.File;
 import java.nio.ByteBuffer;
 import java.util.*;
@@ -110,6 +115,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private volatile boolean mEisEnabled  = false;
 	/** true — железо поддерживает VIDEO_STABILIZATION_MODE_ON */
 	private volatile boolean mEisSupported = false;
+
+	// ─── EIS crop overlay ────────────────────────────────────────────────────
+	/**
+	 * Оверлей превью: тёмная рамка = зона кропа EIS, анимируется по гироскопу.
+	 * Отображается только когда EIS включён.
+	 */
+	private EisCropOverlay mEisOverlay;
+	private SensorManager mSensorMgr;
+	private Sensor mGyro;
+	// Накопленный угол отклонения (рад) по горизонтали и вертикали
+	private float mGyroAngleX = 0f, mGyroAngleY = 0f;
+	private long mGyroLastNs  = 0L;
+	/**
+	 * Типичный коэффициент кропа EIS: 0.88 → 6% полей с каждой стороны.
+	 * Реальное значение зависит от драйвера камеры и не раскрывается через API.
+	 * 0.88 — консервативная оценка, соответствует большинству Qualcomm/MediaTek SoC.
+	 */
+	static final float EIS_CROP = 0.88f;
+	/**
+	 * Скорость коррекции стабилизатора (decay per sample @ 200 Hz).
+	 * Имитирует поведение EIS: медленный дрейф постепенно возвращается к центру.
+	 */
+	static final float EIS_DECAY = 0.985f;
 	
 	// ─── Запись ───────────────────────────────────────────────────────────────
 	private volatile boolean mRecording;
@@ -213,10 +241,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	}
 	
 	@Override
+	protected void onResume() {
+		super.onResume();
+		if (mEisEnabled) startEisOverlay();
+	}
+
+	@Override
 	protected void onPause() {
 		super.onPause();
-		if (mRecording)
-		mRecording = false;
+		if (mRecording) mRecording = false;
+		stopEisOverlay(); // освобождаем гироскоп в фоне
 	}
 	
 	@Override
@@ -275,6 +309,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
 		svLP.gravity = Gravity.CENTER;
 		root.addView(mSv, svLP);
+
+		// ── EIS crop overlay — поверх SurfaceView, под остальными виджетами ───
+		mEisOverlay = new EisCropOverlay(this);
+		mEisOverlay.setVisibility(View.GONE); // показывается только при включённом EIS
+		root.addView(mEisOverlay, new FrameLayout.LayoutParams(
+			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
 		// ── Осциллограф — прозрачный оверлей, верхняя часть кадра ─────────
 		mOscilloscope = new OscilloscopeView(this);
@@ -498,6 +538,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				return;
 			}
 			mEisEnabled = checked;
+			if (checked) {
+				startEisOverlay();
+			} else {
+				stopEisOverlay();
+			}
 			if (mCamHandler != null)
 				mCamHandler.post(MainActivity.this::buildAndSendRequest);
 		});
@@ -2605,6 +2650,215 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					prevLblRight = lblX + lblW + 3f;
 				}
 			}
+		}
+	}
+
+	// =========================================================================
+	// EIS crop overlay helpers
+	// =========================================================================
+
+	/**
+	 * Регистрируем гироскоп и показываем оверлей.
+	 * Вызывается когда EIS включён (чекбокс + onResume).
+	 */
+	private void startEisOverlay() {
+		if (mEisOverlay == null) return;
+		if (mSensorMgr == null)
+			mSensorMgr = (SensorManager) getSystemService(SENSOR_SERVICE);
+		if (mSensorMgr != null && mGyro == null) {
+			mGyro = mSensorMgr.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
+			if (mGyro != null) {
+				mSensorMgr.registerListener(mGyroListener, mGyro,
+					SensorManager.SENSOR_DELAY_GAME); // ~50–200 Hz
+			}
+		}
+		mGyroAngleX = 0f;
+		mGyroAngleY = 0f;
+		mGyroLastNs = 0L;
+		mEisOverlay.setVisibility(View.VISIBLE);
+	}
+
+	/**
+	 * Снимаем регистрацию гироскопа и скрываем оверлей.
+	 * Вызывается когда EIS выключен или приложение уходит в фон.
+	 */
+	private void stopEisOverlay() {
+		if (mSensorMgr != null && mGyro != null) {
+			mSensorMgr.unregisterListener(mGyroListener);
+			mGyro = null;
+		}
+		if (mEisOverlay != null) mEisOverlay.setVisibility(View.GONE);
+	}
+
+	/**
+	 * Слушатель гироскопа.
+	 *
+	 * Интегрируем угловую скорость → угол отклонения.
+	 * Применяем decay — имитируем коррекцию стабилизатора:
+	 * медленный дрейф не накапливается, а возвращается к нулю.
+	 * Затем передаём угол в оверлей как пиксельное смещение.
+	 */
+	private final SensorEventListener mGyroListener = new SensorEventListener() {
+		@Override
+		public void onSensorChanged(SensorEvent ev) {
+			if (mGyroLastNs == 0L) { mGyroLastNs = ev.timestamp; return; }
+			float dt = (ev.timestamp - mGyroLastNs) * 1e-9f; // сек
+			mGyroLastNs = ev.timestamp;
+			if (dt <= 0 || dt > 0.1f) return; // выброс
+
+			// Телефон в ландшафте:
+			//   ev.values[1] (pitch/Y) → горизонтальный сдвиг кадра
+			//   ev.values[0] (roll/X)  → вертикальный сдвиг кадра
+			// Знак подобран так, чтобы прямоугольник двигался «против» движения
+			// руки (туда же, куда EIS смещал бы кроп).
+			mGyroAngleX += ev.values[1] * dt;  // горизонталь
+			mGyroAngleY += ev.values[0] * dt;  // вертикаль
+
+			// Decay — EIS не удерживает постоянное смещение, он корректирует его
+			mGyroAngleX *= EIS_DECAY;
+			mGyroAngleY *= EIS_DECAY;
+
+			if (mEisOverlay != null && mEisOverlay.getVisibility() == View.VISIBLE) {
+				mEisOverlay.updateGyro(mGyroAngleX, mGyroAngleY);
+			}
+		}
+		@Override public void onAccuracyChanged(Sensor s, int a) {}
+	};
+
+	// =========================================================================
+	// EisCropOverlay — внутренний класс
+	// =========================================================================
+
+	/**
+	 * Прозрачный оверлей, показывающий предполагаемые границы стабилизированного
+	 * кадра в реальном времени.
+	 *
+	 * Принцип работы:
+	 *  1. EIS физически кропит сенсорный кадр на EIS_CROP (≈ 88%) по каждой оси.
+	 *     Это означает 6% «мёртвой зоны» с каждой стороны.
+	 *  2. Внутри этой зоны стабилизатор смещает окно просмотра, компенсируя тряску.
+	 *  3. Оверлей рисует тёмное затемнение вокруг «живого» окна и анимирует
+	 *     его смещение по данным гироскопа — чтобы оператор видел, что попадёт
+	 *     в итоговое видео.
+	 *
+	 * Угловые значения гироскопа переводятся в пиксели через приближённый FOV.
+	 * Точный FOV неизвестен, но ошибка ±20% не критична для визуальной индикации.
+	 */
+	private static class EisCropOverlay extends View {
+
+		// Краска для затемнения
+		private final Paint mDimPaint = new Paint();
+		// Краска для рамки стабилизированного кадра
+		private final Paint mBorderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		// Краска для текстовой подписи
+		private final Paint mLabelPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		// Временный Rect для вычислений
+		private final RectF mCropRect = new RectF();
+
+		// Текущее пиксельное смещение (обновляется из gyro listener)
+		private volatile float mOffsetX = 0f, mOffsetY = 0f;
+
+		/**
+		 * Горизонтальный FOV в радианах.
+		 * 60° — типичное значение для широкоугольной камеры телефона.
+		 * Используется только для scale-перевода угла в пиксели.
+		 */
+		private static final float FOV_RAD = (float) Math.toRadians(60.0);
+
+		EisCropOverlay(Context ctx) {
+			super(ctx);
+			setWillNotDraw(false);
+
+			mDimPaint.setColor(0xAA000000); // полупрозрачный чёрный
+			mDimPaint.setStyle(Paint.Style.FILL);
+
+			mBorderPaint.setColor(0xFFFFCC00); // жёлтый — хорошо виден
+			mBorderPaint.setStyle(Paint.Style.STROKE);
+			mBorderPaint.setStrokeWidth(3f);
+			// Пунктирная линия — не перекрывает критически превью
+			mBorderPaint.setPathEffect(new DashPathEffect(new float[]{14f, 6f}, 0f));
+
+			mLabelPaint.setColor(0xFFFFCC00);
+			mLabelPaint.setTextSize(28f);
+			mLabelPaint.setTextAlign(Paint.Align.LEFT);
+			mLabelPaint.setTypeface(Typeface.MONOSPACE);
+		}
+
+		/** Вызывается из SensorEventListener на любом потоке — только пишем volatile */
+		void updateGyro(float angleX, float angleY) {
+			// Приближённый focal length в пикселях на основе текущей ширины view
+			float w = getWidth();
+			float focalPx = w / (2f * (float) Math.tan(FOV_RAD / 2f));
+
+			// Перевод угла в пиксели (малый угол: tan ≈ angle)
+			float rawOffsetX =  angleX * focalPx;
+			float rawOffsetY = -angleY * focalPx;
+
+			// Максимально допустимое смещение = размер EIS-поля в пикселях
+			float marginX = w * (1f - EIS_CROP) / 2f;
+			float marginY = getHeight() * (1f - EIS_CROP) / 2f;
+
+			// Зажимаем: дальше края кропа стабилизатор не уйдёт
+			mOffsetX = Math.max(-marginX, Math.min(marginX, rawOffsetX));
+			mOffsetY = Math.max(-marginY, Math.min(marginY, rawOffsetY));
+
+			postInvalidate(); // инвалидируем из не-UI потока
+		}
+
+		@Override
+		protected void onDraw(Canvas canvas) {
+			int w = getWidth(), h = getHeight();
+			if (w == 0 || h == 0) return;
+
+			// ── Размеры стабилизированного окна ─────────────────────────────
+			float cropW = w * EIS_CROP;
+			float cropH = h * EIS_CROP;
+
+			// ── Смещение: центр кропа ≈ центр кадра + gyro offset ───────────
+			float cx = w * 0.5f + mOffsetX;
+			float cy = h * 0.5f + mOffsetY;
+
+			mCropRect.set(cx - cropW * 0.5f, cy - cropH * 0.5f,
+			              cx + cropW * 0.5f, cy + cropH * 0.5f);
+
+			// ── Затемнение: 4 полосы вокруг окна ────────────────────────────
+			// Левая
+			canvas.drawRect(0,            0, mCropRect.left,  h, mDimPaint);
+			// Правая
+			canvas.drawRect(mCropRect.right, 0, w,           h, mDimPaint);
+			// Верхняя (между левой и правой)
+			canvas.drawRect(mCropRect.left, 0, mCropRect.right, mCropRect.top, mDimPaint);
+			// Нижняя
+			canvas.drawRect(mCropRect.left, mCropRect.bottom, mCropRect.right, h, mDimPaint);
+
+			// ── Рамка стабилизированного окна ────────────────────────────────
+			canvas.drawRect(mCropRect, mBorderPaint);
+
+			// ── Угловые маркеры (Г-образные уголки) для чёткости ─────────────
+			float cm = Math.min(w, h) * 0.04f; // длина уголка
+			mBorderPaint.setPathEffect(null); // уголки без пунктира
+			// top-left
+			canvas.drawLine(mCropRect.left, mCropRect.top + cm, mCropRect.left,  mCropRect.top, mBorderPaint);
+			canvas.drawLine(mCropRect.left, mCropRect.top, mCropRect.left + cm,  mCropRect.top, mBorderPaint);
+			// top-right
+			canvas.drawLine(mCropRect.right - cm, mCropRect.top, mCropRect.right, mCropRect.top, mBorderPaint);
+			canvas.drawLine(mCropRect.right, mCropRect.top, mCropRect.right, mCropRect.top + cm, mBorderPaint);
+			// bottom-left
+			canvas.drawLine(mCropRect.left, mCropRect.bottom - cm, mCropRect.left, mCropRect.bottom, mBorderPaint);
+			canvas.drawLine(mCropRect.left, mCropRect.bottom, mCropRect.left + cm, mCropRect.bottom, mBorderPaint);
+			// bottom-right
+			canvas.drawLine(mCropRect.right - cm, mCropRect.bottom, mCropRect.right, mCropRect.bottom, mBorderPaint);
+			canvas.drawLine(mCropRect.right, mCropRect.bottom - cm, mCropRect.right, mCropRect.bottom, mBorderPaint);
+
+			// Возвращаем пунктир для следующего цикла
+			mBorderPaint.setPathEffect(new DashPathEffect(new float[]{14f, 6f}, 0f));
+
+			// ── Подпись EIS и процент кропа ───────────────────────────────────
+			canvas.drawText(
+				String.format("EIS  crop %.0f%%", (1f - EIS_CROP) * 100f * 2f),
+				mCropRect.left + cm + 6f,
+				mCropRect.top  + 28f,
+				mLabelPaint);
 		}
 	}
 
