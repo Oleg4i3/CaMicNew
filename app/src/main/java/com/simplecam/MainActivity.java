@@ -132,8 +132,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private Handler       mPipHandler;
 	/** Счётчик для пропуска кадров (показываем каждый 3-й → ~10 fps) */
 	private int mPipFrameSkip = 0;
-	/** Размер PiP-кадра — 1/4 от видео, быстрое YUV→RGB */
-	private static final int PIP_W = 320, PIP_H = 180;
+	/**
+	 * PiP ImageReader — того же размера, что и энкодер (VIDEO_W × VIDEO_H).
+	 *
+	 * Почему тот же размер: Camera2 HAL строит комбинацию стримов по размерам.
+	 * Если ImageReader имеет тот же размер, что MediaCodec-поверхность,
+	 * HAL направляет оба в один ISP-выход — стабилизированный видео-стрим.
+	 * ImageReader меньшего размера (320×180) получал превью-стрим без EIS.
+	 * Bitmap масштабируется программно перед показом в PiP-окне.
+	 */
+	private static final int PIP_W = VIDEO_W, PIP_H = VIDEO_H;
 	
 	// ─── Запись ───────────────────────────────────────────────────────────────
 	private volatile boolean mRecording;
@@ -236,6 +244,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		checkPerms();
 	}
 	
+	private volatile boolean mDestroyed = false;
+
 	@Override
 	protected void onResume() {
 		super.onResume();
@@ -253,14 +263,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	@Override
 	protected void onDestroy() {
 		super.onDestroy();
+		mDestroyed = true; // запрещает stopEisOverlay постить startPreview
+		// Сначала освобождаем EIS-ресурсы (без вызова startPreview)
+		if (mPipReader != null) {
+			mPipReader.setOnImageAvailableListener(null, null);
+			mPipReader.close(); mPipReader = null;
+		}
+		if (mPipThread != null) { mPipThread.quitSafely(); mPipThread = null; }
 		if (mCamHandler != null)
 			mCamHandler.removeCallbacks(mZoomRunnable);
 		mVidLoopRunning = false;
 		stopAudio();
 		finalizeMuxer();
-		// EIS PiP cleanup
-		if (mPipReader != null) { mPipReader.close(); mPipReader = null; }
-		if (mPipThread != null) { mPipThread.quitSafely(); mPipThread = null; }
 		if (mVidEnc!=null){try{mVidEnc.stop();mVidEnc.release();}catch(Exception e){} mVidEnc=null;}
 		if (mEncSurface!=null){try{mEncSurface.release();}catch(Exception e){} mEncSurface=null;}
 		try {
@@ -891,9 +905,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	
 	@Override
 	public void surfaceCreated(SurfaceHolder h) {
+		// Фиксируем размер превью-поверхности = размеру энкодера.
+		// Без этого SurfaceView создаёт поверхность в размере экрана (~1920×1080),
+		// и HAL строит EIS-пайплайн под наибольший вывод — превью.
+		// Encoder (1280×720) тогда получает неправильно смещённый кроп.
+		// При одинаковом размере HAL использует один ISP-поток для обоих,
+		// EIS-координаты совпадают, кадр в файле корректно центрирован.
+		h.setFixedSize(VIDEO_W, VIDEO_H);
 		mSurfaceReady = true;
-		if (mPermsOk)
-		openCamera();
+		if (mPermsOk) openCamera();
 	}
 	
 	@Override
@@ -2731,9 +2751,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			Image img = reader.acquireLatestImage();
 			if (img == null) return;
 			try {
-				Bitmap bmp = yuv420ToBitmap(img);
+				Bitmap full = yuv420ToBitmap(img);
+				// Масштабируем 1280×720 → 320×180 для отображения в PiP-окне.
+				// Делаем это в фоновом потоке — не нагружаем UI-поток.
+				Bitmap pip = Bitmap.createScaledBitmap(full, 320, 180, false);
+				full.recycle();
 				runOnUiThread(() -> {
-					if (mPipView != null) mPipView.setImageBitmap(bmp);
+					if (mPipView != null) mPipView.setImageBitmap(pip);
 				});
 			} finally {
 				img.close();
@@ -2750,7 +2774,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		});
 
 		// Пересоздаём capture session — теперь с ImageReader в targets
-		if (mCamHandler != null) mCamHandler.post(this::startPreview);
+		if (!mDestroyed && mCamHandler != null && mCamDev != null)
+			mCamHandler.post(this::startPreview);
 	}
 
 	/**
@@ -2778,8 +2803,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			mPipThread = null;
 			mPipHandler = null;
 		}
-		// Пересоздаём сессию без ImageReader
-		if (mCamHandler != null) mCamHandler.post(this::startPreview);
+		// Пересоздаём сессию без ImageReader — только если камера ещё жива
+		if (!mDestroyed && mCamHandler != null && mCamDev != null)
+			mCamHandler.post(this::startPreview);
 	}
 
 	/**
