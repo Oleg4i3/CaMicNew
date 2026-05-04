@@ -8,6 +8,7 @@ import android.content.pm.PackageManager;
 import android.graphics.*;
 import android.graphics.drawable.GradientDrawable;
 import android.hardware.camera2.*;
+import android.hardware.camera2.params.MeteringRectangle;
 import android.media.*;
 import android.media.MediaCodecInfo.CodecCapabilities;
 import android.media.MediaCodecInfo.CodecProfileLevel;
@@ -142,6 +143,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (mCamThread != null) mCamThread.quitSafely();
     }
 
+    // ---------- UI ----------
     private View buildLayout() {
         FrameLayout root = new FrameLayout(this); root.setBackgroundColor(Color.BLACK);
         mSv = new SurfaceView(this) {
@@ -305,10 +307,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (need.isEmpty()) { mPermsOk = true; if (mSurfaceReady) openCamera(); }
         else requestPermissions(need.toArray(new String[0]), REQ_PERMS);
     }
-    @Override public void onRequestPermissionsResult(int req, String[] perms, int[] res) { for (int r : res) if (r != PackageManager.PERMISSION_GRANTED) { status("Permissions required"); return; } mPermsOk = true; if (mSurfaceReady) openCamera(); }
-    @Override public void surfaceCreated(SurfaceHolder h) { mSurfaceReady = true; if (mPermsOk) openCamera(); }
-    @Override public void surfaceChanged(SurfaceHolder h, int f, int w, int t) {}
-    @Override public void surfaceDestroyed(SurfaceHolder h) { mSurfaceReady = false; }
+	
+	    @Override
+    public void onRequestPermissionsResult(int req, String[] perms, int[] res) {
+        for (int r : res) if (r != PackageManager.PERMISSION_GRANTED) { status("Permissions required"); return; }
+        mPermsOk = true; if (mSurfaceReady) openCamera();
+    }
+    @Override
+    public void surfaceCreated(SurfaceHolder h) { mSurfaceReady = true; if (mPermsOk) openCamera(); }
+    @Override
+    public void surfaceChanged(SurfaceHolder h, int f, int w, int t) {}
+    @Override
+    public void surfaceDestroyed(SurfaceHolder h) { mSurfaceReady = false; }
 
     @SuppressLint("MissingPermission")
     private void openCamera() {
@@ -353,29 +363,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }, mCamHandler);
         } catch (Exception e) { status("startPreview: " + e.getMessage()); }
     }
-	
-	    // Продолжение – методы камеры, аудио, запись и кастомные View
 
     private void buildAndSendRequest() {
         CameraCaptureSession sess = mCapSess; CameraDevice dev = mCamDev;
         if (sess == null || dev == null || !mSurfaceReady) return;
         try {
-            // При записи используем TEMPLATE_RECORD, как в HedgeCam
             int template = mRecording ? CameraDevice.TEMPLATE_RECORD : CameraDevice.TEMPLATE_PREVIEW;
             CaptureRequest.Builder rb = dev.createCaptureRequest(template);
             rb.addTarget(mSv.getHolder().getSurface());
             if (mEncSurface != null && mEncSurface.isValid()) rb.addTarget(mEncSurface);
-            if (mManualFocus) {
-                rb.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF);
-                rb.set(CaptureRequest.LENS_FOCUS_DISTANCE, mFocusValue * mMinFocusDist);
-            } else {
-                rb.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO);
-            }
+            if (mManualFocus) { rb.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF); rb.set(CaptureRequest.LENS_FOCUS_DISTANCE, mFocusValue * mMinFocusDist); }
+            else rb.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO);
             rb.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
             rb.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, mEvComp);
-            rb.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
-                    (mEisEnabled && mEisSupported) ? CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
-                            : CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF);
+            rb.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, (mEisEnabled && mEisSupported) ? CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON : CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF);
             if (mSensorRect != null) {
                 int cropW = Math.max(1, (int)(mSensorRect.width() / mZoomLevel));
                 int cropH = Math.max(1, (int)(mSensorRect.height() / mZoomLevel));
@@ -390,31 +391,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private void onPauseClick() {
         mPaused = !mPaused;
         if (mPaused) {
-            mPauseStartNano = System.nanoTime();
-            mVidWriteMode = 0; mAudWriteMode = 0;
-            synchronized (mVidRingLock) { mVidRing.clear(); }
-            synchronized (mAudRingLock) { mAudRing.clear(); }
-            mBtnPause.setText("▶"); mBtnPause.setBackground(makeOval(0xFF228833));
-            status("⏸ Paused");
+            mPauseStartNano = System.nanoTime(); mVidWriteMode = 0; mAudWriteMode = 0;
+            synchronized (mVidRingLock) { mVidRing.clear(); } synchronized (mAudRingLock) { mAudRing.clear(); }
+            mBtnPause.setText("▶"); mBtnPause.setBackground(makeOval(0xFF228833)); status("⏸ Paused");
         } else {
-            mPauseEndNano = System.nanoTime();
-            long pauseDurUs = (mPauseEndNano - mPauseStartNano) / 1000L;
-            mMuxBasePts += pauseDurUs;
-            mVidWriteMode = 2; mAudWriteMode = 2;
-            mBtnPause.setText("⏸"); mBtnPause.setBackground(mBtnBgPause);
-            status("● REC (resumed)");
+            mPauseEndNano = System.nanoTime(); long pauseDurUs = (mPauseEndNano - mPauseStartNano) / 1000L;
+            mMuxBasePts += pauseDurUs; mVidWriteMode = 2; mAudWriteMode = 2;
+            mBtnPause.setText("⏸"); mBtnPause.setBackground(mBtnBgPause); status("● REC (resumed)");
         }
     }
 
-    private void onRecordClick() {
-        if (mRecording) {
-            mRecording = false; mBtn.setEnabled(false); status("Stopping…");
-            new Thread(this::doStop).start();
-        } else {
-            mBtn.setEnabled(false); status("Starting…");
-            new Thread(this::doStart).start();
-        }
-    }
+    private void onRecordClick() { if (mRecording) { mRecording = false; mBtn.setEnabled(false); status("Stopping…"); new Thread(this::doStop).start(); } else { mBtn.setEnabled(false); status("Starting…"); new Thread(this::doStart).start(); } }
 
     private synchronized void ensureEncoders() {
         if (mVidEnc == null || mEncSurface == null || !mEncSurface.isValid()) {
@@ -422,21 +409,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 if (mVidEnc != null) { try { mVidEnc.stop(); mVidEnc.release(); } catch (Exception e) {} mVidEnc = null; }
                 if (mEncSurface != null) { try { mEncSurface.release(); } catch (Exception e) {} mEncSurface = null; }
                 MediaFormat vf = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, VIDEO_W, VIDEO_H);
-                vf.setInteger(MediaFormat.KEY_BIT_RATE, mVideoBps);
-                vf.setInteger(MediaFormat.KEY_FRAME_RATE, VIDEO_FPS);
-                vf.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
-                vf.setInteger(MediaFormat.KEY_COLOR_FORMAT, CodecCapabilities.COLOR_FormatSurface);
-                vf.setInteger(MediaFormat.KEY_PROFILE, CodecProfileLevel.AVCProfileBaseline);
-                vf.setInteger(MediaFormat.KEY_LEVEL, CodecProfileLevel.AVCLevel31);
+                vf.setInteger(MediaFormat.KEY_BIT_RATE, mVideoBps); vf.setInteger(MediaFormat.KEY_FRAME_RATE, VIDEO_FPS);
+                vf.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1); vf.setInteger(MediaFormat.KEY_COLOR_FORMAT, CodecCapabilities.COLOR_FormatSurface);
+                vf.setInteger(MediaFormat.KEY_PROFILE, CodecProfileLevel.AVCProfileBaseline); vf.setInteger(MediaFormat.KEY_LEVEL, CodecProfileLevel.AVCLevel31);
                 mVidEnc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
                 mVidEnc.configure(vf, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
                 mEncSurface = mVidEnc.createInputSurface(); mVidEnc.start();
                 mVidOutFmt = null; synchronized (mVidRingLock) { mVidRing.clear(); } mVidWriteMode = 0;
             } catch (Exception e) { status("VidEnc err: " + e.getMessage()); return; }
         }
-        if (!mVidLoopRunning) {
-            Thread t = new Thread(this::videoPreviewLoop, "vid-preview"); t.setDaemon(true); t.start();
-        }
+        if (!mVidLoopRunning) { Thread t = new Thread(this::videoPreviewLoop, "vid-preview"); t.setDaemon(true); t.start(); }
     }
 
     private void videoPreviewLoop() {
@@ -448,41 +430,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             if (out == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) { synchronized (mVidRingLock) { mVidOutFmt = enc.getOutputFormat(); } continue; }
             if (out < 0) continue;
             try {
-                boolean cfg = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
-                if (cfg || info.size <= 0) continue;
+                boolean cfg = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0; if (cfg || info.size <= 0) continue;
                 ByteBuffer data = enc.getOutputBuffer(out); if (data == null) continue;
                 int mode = mVidWriteMode;
                 if (mode == 0) {
                     EncodedFrame f = new EncodedFrame(data, info);
-                    synchronized (mVidRingLock) {
-                        mVidRing.addLast(f);
-                        long eisExtra = (mEisEnabled && mEisSupported) ? EIS_LATENCY_US : 0L;
-                        while (mVidRing.size() > 1) {
-                            long span = mVidRing.peekLast().pts - mVidRing.peekFirst().pts;
-                            if (span <= (long) mPreBufSecs * 1_200_000L + eisExtra) break;
-                            mVidRing.removeFirst();
-                        }
-                    }
+                    synchronized (mVidRingLock) { mVidRing.addLast(f); long eisExtra = (mEisEnabled && mEisSupported) ? EIS_LATENCY_US : 0L; while (mVidRing.size() > 1) { long span = mVidRing.peekLast().pts - mVidRing.peekFirst().pts; if (span <= (long) mPreBufSecs * 1_200_000L + eisExtra) break; mVidRing.removeFirst(); } }
                 } else if (mode == 1) {
-                    synchronized (mVidRingLock) {
-                        boolean foundKey = false;
-                        for (EncodedFrame rf : mVidRing) {
-                            if (!foundKey && !rf.isKey()) continue;
-                            foundKey = true;
-                            ByteBuffer rb = ByteBuffer.wrap(rf.data);
-                            MediaCodec.BufferInfo bi = new MediaCodec.BufferInfo();
-                            bi.set(0, rf.data.length, rf.pts - mMuxBasePts, rf.flags);
-                            synchronized (mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mVidTrack, rb, bi); }
-                        }
-                        mVidRing.clear();
-                    }
-                    MediaCodec.BufferInfo n = new MediaCodec.BufferInfo();
-                    n.set(info.offset, info.size, info.presentationTimeUs - mMuxBasePts, info.flags);
-                    synchronized (mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mVidTrack, data, n); }
-                    mVidWriteMode = 2;
+                    synchronized (mVidRingLock) { boolean foundKey = false; for (EncodedFrame rf : mVidRing) { if (!foundKey && !rf.isKey()) continue; foundKey = true; ByteBuffer rb = ByteBuffer.wrap(rf.data); MediaCodec.BufferInfo bi = new MediaCodec.BufferInfo(); bi.set(0, rf.data.length, rf.pts - mMuxBasePts, rf.flags); synchronized (mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mVidTrack, rb, bi); } } mVidRing.clear(); }
+                    MediaCodec.BufferInfo n = new MediaCodec.BufferInfo(); n.set(info.offset, info.size, info.presentationTimeUs - mMuxBasePts, info.flags);
+                    synchronized (mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mVidTrack, data, n); } mVidWriteMode = 2;
                 } else {
-                    MediaCodec.BufferInfo n = new MediaCodec.BufferInfo();
-                    n.set(info.offset, info.size, info.presentationTimeUs - mMuxBasePts, info.flags);
+                    MediaCodec.BufferInfo n = new MediaCodec.BufferInfo(); n.set(info.offset, info.size, info.presentationTimeUs - mMuxBasePts, info.flags);
                     synchronized (mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mVidTrack, data, n); }
                 }
             } finally { enc.releaseOutputBuffer(out, false); }
@@ -493,39 +452,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @SuppressLint("MissingPermission")
     private void startMonitor() {
         if (mAudRunning || !mPermsOk) return;
-        int pos = mSpinner.getSelectedItemPosition();
-        AudioSrcItem s2 = (pos >= 0 && pos < mSrcList.size()) ? mSrcList.get(pos) : null;
+        int pos = mSpinner.getSelectedItemPosition(); AudioSrcItem s2 = (pos >= 0 && pos < mSrcList.size()) ? mSrcList.get(pos) : null;
         int audioSrc = s2 != null ? s2.audioSource : MediaRecorder.AudioSource.MIC;
         int chCfg = AudioFormat.CHANNEL_IN_STEREO, ch = 2;
         int minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chCfg, AudioFormat.ENCODING_PCM_16BIT);
         if (minBuf <= 0) { chCfg = AudioFormat.CHANNEL_IN_MONO; ch = 1; minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chCfg, AudioFormat.ENCODING_PCM_16BIT); }
         int bufSz = Math.max(minBuf, AUDIO_SR * ch * 2 / 5);
         AudioRecord rec = new AudioRecord(audioSrc, AUDIO_SR, chCfg, AudioFormat.ENCODING_PCM_16BIT, bufSz);
-        if (rec.getState() != AudioRecord.STATE_INITIALIZED && ch == 2) {
-            rec.release(); chCfg = AudioFormat.CHANNEL_IN_MONO; ch = 1;
-            minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chCfg, AudioFormat.ENCODING_PCM_16BIT);
-            bufSz = Math.max(minBuf, AUDIO_SR * 2 / 5);
-            rec = new AudioRecord(audioSrc, AUDIO_SR, chCfg, AudioFormat.ENCODING_PCM_16BIT, bufSz);
-        }
+        if (rec.getState() != AudioRecord.STATE_INITIALIZED && ch == 2) { rec.release(); chCfg = AudioFormat.CHANNEL_IN_MONO; ch = 1; minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chCfg, AudioFormat.ENCODING_PCM_16BIT); bufSz = Math.max(minBuf, AUDIO_SR * 2 / 5); rec = new AudioRecord(audioSrc, AUDIO_SR, chCfg, AudioFormat.ENCODING_PCM_16BIT, bufSz); }
         if (rec.getState() != AudioRecord.STATE_INITIALIZED) { rec.release(); return; }
         if (Build.VERSION.SDK_INT >= 23 && s2 != null && s2.device != null) rec.setPreferredDevice(s2.device);
-        disableAudioEffects(rec.getAudioSessionId());
-        mAudRec = rec; mAudChannels = ch;
+        disableAudioEffects(rec.getAudioSessionId()); mAudRec = rec; mAudChannels = ch;
         try {
             MediaFormat af = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, AUDIO_SR, ch);
-            af.setInteger(MediaFormat.KEY_BIT_RATE, ch == 1 ? 192_000 : 320_000);
-            af.setInteger(MediaFormat.KEY_AAC_PROFILE, CodecProfileLevel.AACObjectLC);
-            mAudEnc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC);
-            mAudEnc.configure(af, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE); mAudEnc.start();
+            af.setInteger(MediaFormat.KEY_BIT_RATE, ch == 1 ? 192_000 : 320_000); af.setInteger(MediaFormat.KEY_AAC_PROFILE, CodecProfileLevel.AACObjectLC);
+            mAudEnc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC); mAudEnc.configure(af, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE); mAudEnc.start();
             mAudOutFmt = null; synchronized (mAudRingLock) { mAudRing.clear(); } mAudWriteMode = 0;
         } catch (Exception e) { status("AudEnc err: " + e.getMessage()); mAudEnc = null; }
-        mAudRunning = true;
-        mAudThread = new Thread(this::audioMainLoop, "aud-main"); mAudThread.setDaemon(true); mAudThread.start();
+        mAudRunning = true; mAudThread = new Thread(this::audioMainLoop, "aud-main"); mAudThread.setDaemon(true); mAudThread.start();
     }
 
     private void stopAudio() {
-        mAudRunning = false;
-        if (mAudRec != null) try { mAudRec.stop(); } catch (Exception ignored) {}
+        mAudRunning = false; if (mAudRec != null) try { mAudRec.stop(); } catch (Exception ignored) {}
         if (mAudThread != null) { try { mAudThread.join(600); } catch (Exception ignored) {} mAudThread = null; }
         if (mAudRec != null) { try { mAudRec.release(); } catch (Exception ignored) {} mAudRec = null; }
         if (mAudEnc != null) { try { mAudEnc.stop(); mAudEnc.release(); } catch (Exception ignored) {} mAudEnc = null; }
@@ -539,8 +487,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void audioMainLoop() {
-        AudioRecord rec = mAudRec; int ch = mAudChannels; int chunkSamples = AUDIO_SR * ch / 50;
-        short[] buf = new short[chunkSamples];
+        AudioRecord rec = mAudRec; int ch = mAudChannels; int chunkSamples = AUDIO_SR * ch / 50; short[] buf = new short[chunkSamples];
         long startUs = System.nanoTime() / 1000L, totalFrames = 0L; rec.startRecording();
         while (mAudRunning) {
             int r = rec.read(buf, 0, chunkSamples); if (r <= 0) continue;
@@ -574,17 +521,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             try {
                 boolean cfg = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0; if (cfg || info.size <= 0) continue;
                 ByteBuffer data = enc.getOutputBuffer(out); int mode = mAudWriteMode;
-                if (mode == 0) {
-                    EncodedFrame f = new EncodedFrame(data, info);
-                    synchronized (mAudRingLock) { mAudRing.addLast(f); while (mAudRing.size() > 1) { long span = mAudRing.peekLast().pts - mAudRing.peekFirst().pts; if (span <= (long) mPreBufSecs * 1_200_000L) break; mAudRing.removeFirst(); } }
-                } else if (mode == 1) {
-                    synchronized (mAudRingLock) { boolean started = false; for (EncodedFrame rf : mAudRing) { if (!started && rf.pts < mMuxBasePts) continue; started = true; ByteBuffer rb = ByteBuffer.wrap(rf.data); MediaCodec.BufferInfo bi = new MediaCodec.BufferInfo(); bi.set(0, rf.data.length, rf.pts - mMuxBasePts, rf.flags); synchronized (mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mAudTrack, rb, bi); } } mAudRing.clear(); }
-                    MediaCodec.BufferInfo n = new MediaCodec.BufferInfo(); n.set(info.offset, info.size, info.presentationTimeUs - mMuxBasePts, info.flags);
-                    synchronized (mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mAudTrack, data, n); } mAudWriteMode = 2;
-                } else {
-                    MediaCodec.BufferInfo n = new MediaCodec.BufferInfo(); n.set(info.offset, info.size, info.presentationTimeUs - mMuxBasePts, info.flags);
-                    synchronized (mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mAudTrack, data, n); }
-                }
+                if (mode == 0) { EncodedFrame f = new EncodedFrame(data, info); synchronized (mAudRingLock) { mAudRing.addLast(f); while (mAudRing.size() > 1) { long span = mAudRing.peekLast().pts - mAudRing.peekFirst().pts; if (span <= (long) mPreBufSecs * 1_200_000L) break; mAudRing.removeFirst(); } } }
+                else if (mode == 1) { synchronized (mAudRingLock) { boolean started = false; for (EncodedFrame rf : mAudRing) { if (!started && rf.pts < mMuxBasePts) continue; started = true; ByteBuffer rb = ByteBuffer.wrap(rf.data); MediaCodec.BufferInfo bi = new MediaCodec.BufferInfo(); bi.set(0, rf.data.length, rf.pts - mMuxBasePts, rf.flags); synchronized (mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mAudTrack, rb, bi); } } mAudRing.clear(); } MediaCodec.BufferInfo n = new MediaCodec.BufferInfo(); n.set(info.offset, info.size, info.presentationTimeUs - mMuxBasePts, info.flags); synchronized (mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mAudTrack, data, n); } mAudWriteMode = 2; }
+                else { MediaCodec.BufferInfo n = new MediaCodec.BufferInfo(); n.set(info.offset, info.size, info.presentationTimeUs - mMuxBasePts, info.flags); synchronized (mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mAudTrack, data, n); } }
             } finally { enc.releaseOutputBuffer(out, false); }
             if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break;
         }
@@ -595,37 +534,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         try {
             for (int w = 0; w < 40 && (mVidOutFmt == null || mAudOutFmt == null); w++) Thread.sleep(50);
             if (mVidOutFmt == null || mAudOutFmt == null) { runOnUiThread(() -> { mBtn.setEnabled(true); status("Encoder not ready"); }); return; }
-            long basePts;
-            synchronized (mVidRingLock) {
-                if (mPreBufferEnabled) {
-                    basePts = Long.MAX_VALUE;
-                    for (EncodedFrame f : mVidRing) if (f.isKey()) { basePts = f.pts; break; }
-                    if (basePts == Long.MAX_VALUE) basePts = 0;
-                } else basePts = System.nanoTime() / 1000L;
-            }
+            long basePts; synchronized (mVidRingLock) { if (mPreBufferEnabled) { basePts = Long.MAX_VALUE; for (EncodedFrame f : mVidRing) if (f.isKey()) { basePts = f.pts; break; } if (basePts == Long.MAX_VALUE) basePts = 0; } else basePts = System.nanoTime() / 1000L; }
             mMuxBasePts = basePts;
             String displayPath;
-            if (Build.VERSION.SDK_INT >= 29) {
-                ContentValues cv = new ContentValues(); cv.put(MediaStore.Video.Media.DISPLAY_NAME, "VID_" + System.currentTimeMillis() + ".mp4"); cv.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4"); cv.put(MediaStore.Video.Media.RELATIVE_PATH, "DCIM/CaMic"); cv.put(MediaStore.Video.Media.IS_PENDING, 1);
-                mPendingUri = getContentResolver().insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, cv);
-                mPfd = getContentResolver().openFileDescriptor(mPendingUri, "rw");
-                mMuxer = new MediaMuxer(mPfd.getFileDescriptor(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4); displayPath = "DCIM/CaMic";
-            } else {
-                @SuppressWarnings("deprecation") File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "CaMic"); dir.mkdirs();
-                File f = new File(dir, "VID_" + System.currentTimeMillis() + ".mp4");
-                mMuxer = new MediaMuxer(f.getAbsolutePath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4); displayPath = f.getAbsolutePath();
-            }
-            @SuppressWarnings("deprecation") int rot = getWindowManager().getDefaultDisplay().getRotation() * 90;
-            mMuxer.setOrientationHint((mSensorOrientation - rot + 360) % 360);
+            if (Build.VERSION.SDK_INT >= 29) { ContentValues cv = new ContentValues(); cv.put(MediaStore.Video.Media.DISPLAY_NAME, "VID_" + System.currentTimeMillis() + ".mp4"); cv.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4"); cv.put(MediaStore.Video.Media.RELATIVE_PATH, "DCIM/CaMic"); cv.put(MediaStore.Video.Media.IS_PENDING, 1); mPendingUri = getContentResolver().insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, cv); mPfd = getContentResolver().openFileDescriptor(mPendingUri, "rw"); mMuxer = new MediaMuxer(mPfd.getFileDescriptor(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4); displayPath = "DCIM/CaMic"; }
+            else { @SuppressWarnings("deprecation") File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "CaMic"); dir.mkdirs(); File f = new File(dir, "VID_" + System.currentTimeMillis() + ".mp4"); mMuxer = new MediaMuxer(f.getAbsolutePath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4); displayPath = f.getAbsolutePath(); }
+            @SuppressWarnings("deprecation") int rot = getWindowManager().getDefaultDisplay().getRotation() * 90; mMuxer.setOrientationHint((mSensorOrientation - rot + 360) % 360);
             synchronized (mMuxLock) { mVidTrack = mMuxer.addTrack(mVidOutFmt); mAudTrack = mMuxer.addTrack(mAudOutFmt); mMuxer.start(); mMuxReady = true; }
             mRecording = true; if (mPreBufferEnabled) { mVidWriteMode = 1; mAudWriteMode = 1; } else { mVidWriteMode = 2; mAudWriteMode = 2; }
             final String fp = displayPath;
-            runOnUiThread(() -> {
-                mBtn.setText("⏹ STOP"); mBtn.setBackground(mBtnBgRec); mBtn.setEnabled(true);
-                mBtnPause.setVisibility(View.VISIBLE); mBtnPause.setText("⏸"); mBtnPause.setBackground(mBtnBgPause); mPaused = false;
-                if (mCbEis != null) mCbEis.setEnabled(false);
-                status("● REC → " + fp);
-            });
+            runOnUiThread(() -> { mBtn.setText("⏹ STOP"); mBtn.setBackground(mBtnBgRec); mBtn.setEnabled(true); mBtnPause.setVisibility(View.VISIBLE); mBtnPause.setText("⏸"); mBtnPause.setBackground(mBtnBgPause); mPaused = false; if (mCbEis != null) mCbEis.setEnabled(false); status("● REC → " + fp); });
         } catch (Exception e) { mRecording = false; mVidWriteMode = 0; mAudWriteMode = 0; finalizeMuxer(); runOnUiThread(() -> { mBtn.setText("⏺ REC"); mBtn.setBackground(mBtnBgIdle); mBtn.setEnabled(true); mBtnPause.setVisibility(View.GONE); if (mCbEis != null) mCbEis.setEnabled(mEisSupported); status("Error: " + e.getMessage()); }); }
     }
 
@@ -642,29 +560,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private void buildAudioSources() {
         List<AudioSrcItem> list = new ArrayList<>();
-        if (Build.VERSION.SDK_INT >= 23) {
-            AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE); AudioDeviceInfo[] devs = am.getDevices(AudioManager.GET_DEVICES_INPUTS); boolean hasBuiltin = false;
-            for (AudioDeviceInfo d : devs) {
-                int t = d.getType();
-                if (t == AudioDeviceInfo.TYPE_BUILTIN_MIC) { if (hasBuiltin) continue; hasBuiltin = true; list.add(new AudioSrcItem("Built-in mic", MediaRecorder.AudioSource.MIC, d)); if (Build.VERSION.SDK_INT >= 24) list.add(new AudioSrcItem("Built-in mic (raw)", MediaRecorder.AudioSource.UNPROCESSED, d)); }
-                else if (t == AudioDeviceInfo.TYPE_USB_DEVICE || t == AudioDeviceInfo.TYPE_USB_HEADSET) { CharSequence pn = d.getProductName(); list.add(new AudioSrcItem("USB: " + (pn != null && pn.length() > 0 ? pn : "audio"), MediaRecorder.AudioSource.MIC, d)); }
-                else if (t == AudioDeviceInfo.TYPE_WIRED_HEADSET) list.add(new AudioSrcItem("Wired headset", MediaRecorder.AudioSource.MIC, d));
-                else if (t == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) list.add(new AudioSrcItem("Bluetooth mic", MediaRecorder.AudioSource.MIC, d));
-            }
-        }
+        if (Build.VERSION.SDK_INT >= 23) { AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE); AudioDeviceInfo[] devs = am.getDevices(AudioManager.GET_DEVICES_INPUTS); boolean hasBuiltin = false; for (AudioDeviceInfo d : devs) { int t = d.getType(); if (t == AudioDeviceInfo.TYPE_BUILTIN_MIC) { if (hasBuiltin) continue; hasBuiltin = true; list.add(new AudioSrcItem("Built-in mic", MediaRecorder.AudioSource.MIC, d)); if (Build.VERSION.SDK_INT >= 24) list.add(new AudioSrcItem("Built-in mic (raw)", MediaRecorder.AudioSource.UNPROCESSED, d)); } else if (t == AudioDeviceInfo.TYPE_USB_DEVICE || t == AudioDeviceInfo.TYPE_USB_HEADSET) { CharSequence pn = d.getProductName(); list.add(new AudioSrcItem("USB: " + (pn != null && pn.length() > 0 ? pn : "audio"), MediaRecorder.AudioSource.MIC, d)); } else if (t == AudioDeviceInfo.TYPE_WIRED_HEADSET) list.add(new AudioSrcItem("Wired headset", MediaRecorder.AudioSource.MIC, d)); else if (t == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) list.add(new AudioSrcItem("Bluetooth mic", MediaRecorder.AudioSource.MIC, d)); } }
         if (list.isEmpty()) { list.add(new AudioSrcItem("Default", MediaRecorder.AudioSource.DEFAULT, null)); list.add(new AudioSrcItem("Microphone", MediaRecorder.AudioSource.MIC, null)); list.add(new AudioSrcItem("Camcorder", MediaRecorder.AudioSource.CAMCORDER, null)); list.add(new AudioSrcItem("Communication", MediaRecorder.AudioSource.VOICE_COMMUNICATION, null)); if (Build.VERSION.SDK_INT >= 24) list.add(new AudioSrcItem("Unprocessed (raw)", MediaRecorder.AudioSource.UNPROCESSED, null)); }
-        runOnUiThread(() -> {
-            mSrcList.clear(); mSrcList.addAll(list); List<String> names = new ArrayList<>(); for (AudioSrcItem i : mSrcList) names.add(i.name);
-            @SuppressWarnings("unchecked") ArrayAdapter<String> a2 = (ArrayAdapter<String>) mSpinner.getAdapter(); a2.clear(); a2.addAll(names); a2.notifyDataSetChanged();
-            int defIdx = 0; for (int i = 0; i < mSrcList.size(); i++) { AudioSrcItem it = mSrcList.get(i); if (it.device != null && Build.VERSION.SDK_INT >= 23) { int tp = it.device.getType(); if (tp == AudioDeviceInfo.TYPE_USB_DEVICE || tp == AudioDeviceInfo.TYPE_USB_HEADSET) { defIdx = i; break; } } }
-            if (defIdx == 0) for (int i = 0; i < mSrcList.size(); i++) if (mSrcList.get(i).audioSource == MediaRecorder.AudioSource.UNPROCESSED) { defIdx = i; break; }
-            mSpinner.setSelection(defIdx); if (!mRecording) { stopAudio(); startMonitor(); }
-        });
+        runOnUiThread(() -> { mSrcList.clear(); mSrcList.addAll(list); List<String> names = new ArrayList<>(); for (AudioSrcItem i : mSrcList) names.add(i.name); @SuppressWarnings("unchecked") ArrayAdapter<String> a2 = (ArrayAdapter<String>) mSpinner.getAdapter(); a2.clear(); a2.addAll(names); a2.notifyDataSetChanged(); int defIdx = 0; for (int i = 0; i < mSrcList.size(); i++) { AudioSrcItem it = mSrcList.get(i); if (it.device != null && Build.VERSION.SDK_INT >= 23) { int tp = it.device.getType(); if (tp == AudioDeviceInfo.TYPE_USB_DEVICE || tp == AudioDeviceInfo.TYPE_USB_HEADSET) { defIdx = i; break; } } } if (defIdx == 0) for (int i = 0; i < mSrcList.size(); i++) if (mSrcList.get(i).audioSource == MediaRecorder.AudioSource.UNPROCESSED) { defIdx = i; break; } mSpinner.setSelection(defIdx); if (!mRecording) { stopAudio(); startMonitor(); } });
     }
 
     private static class AudioSrcItem { final String name; final int audioSource; final AudioDeviceInfo device; AudioSrcItem(String n, int s, AudioDeviceInfo d) { name = n; audioSource = s; device = d; } }
 
-    // -------- CUSTOM VIEWS (identical to your original file, fully included) --------
+    // -------- CUSTOM VIEWS --------
     static class VerticalSeekBar extends View { private int mMax=100,mProgress=0; private final Paint mTrackPaint=new Paint(Paint.ANTI_ALIAS_FLAG),mFillPaint=new Paint(Paint.ANTI_ALIAS_FLAG),mThumbPaint=new Paint(Paint.ANTI_ALIAS_FLAG),mRidgePaint=new Paint(Paint.ANTI_ALIAS_FLAG); private SeekBar.OnSeekBarChangeListener mListener; VerticalSeekBar(Context c){ super(c); mTrackPaint.setColor(0x44FFFFFF); mFillPaint.setColor(0xFFDDCC00); mThumbPaint.setColor(0xFFEEEEEE); mRidgePaint.setColor(0xFF888866); mRidgePaint.setStyle(Paint.Style.STROKE); mRidgePaint.setStrokeWidth(1.2f*c.getResources().getDisplayMetrics().density); setClickable(true); } void setMax(int m){mMax=m;invalidate();} void setProgress(int p){mProgress=Math.max(0,Math.min(mMax,p));invalidate();} int getMax(){return mMax;} int getProgress(){return mProgress;} void setOnSeekBarChangeListener(SeekBar.OnSeekBarChangeListener l){mListener=l;} private float faderH(float w){return Math.round(w*0.7f)+dp(20);} private int dp(int x){return Math.round(x*getResources().getDisplayMetrics().density);} @Override protected void onDraw(Canvas g){ float w=getWidth(),h=getHeight(),trackW=w*0.3f,cx=w/2f,trkX1=cx-trackW/2f,trkX2=cx+trackW/2f,halfFader=faderH(w)/2f,padV=halfFader+2f,trkT=padV,trkB=h-padV,trkH=trkB-trkT; float frac=mMax>0?(float)mProgress/mMax:0f,thumbY=trkB-frac*trkH; g.drawRoundRect(new RectF(trkX1,trkT,trkX2,trkB),trackW/2f,trackW/2f,mTrackPaint); g.drawRoundRect(new RectF(trkX1,thumbY,trkX2,trkB),trackW/2f,trackW/2f,mFillPaint); Paint z=new Paint(Paint.ANTI_ALIAS_FLAG);z.setColor(0x88FFFFFF);z.setStrokeWidth(1.5f); g.drawLine(trkX1-3f,trkB-0.5f*trkH,trkX2+3f,trkB-0.5f*trkH,z); float fH=faderH(w),fW=w-2f; RectF fader=new RectF(1f,thumbY-fH/2f,1f+fW,thumbY+fH/2f); Paint sh=new Paint(Paint.ANTI_ALIAS_FLAG);sh.setColor(0x66000000);sh.setStyle(Paint.Style.FILL); g.drawRoundRect(new RectF(fader.left+2,fader.top+3,fader.right+2,fader.bottom+3),dp(4),dp(4),sh); g.drawRoundRect(fader,dp(4),dp(4),mThumbPaint); float rInset=fW*0.18f; for(int ri=-1;ri<=1;ri++){float ry=thumbY+ri*dp(4);g.drawLine(1f+rInset,ry,1f+fW-rInset,ry,mRidgePaint);} Paint cL=new Paint(Paint.ANTI_ALIAS_FLAG);cL.setColor(0xFFDDCC00);cL.setStrokeWidth(1.5f); g.drawLine(1f+rInset*0.6f,thumbY,1f+fW-rInset*0.6f,thumbY,cL); } @Override public boolean onTouchEvent(MotionEvent e){ if(!isEnabled())return false; float h=getHeight(),w=getWidth(),halfFader=faderH(w)/2f,padV=halfFader+2f,trkT=padV,trkB=h-padV,trkH=trkB-trkT; switch(e.getAction()){ case MotionEvent.ACTION_DOWN:if(mListener!=null)mListener.onStartTrackingTouch(null); case MotionEvent.ACTION_MOVE:{float frac=1f-(e.getY()-trkT)/trkH;int p=Math.max(0,Math.min(mMax,Math.round(frac*mMax)));mProgress=p;invalidate();if(mListener!=null)mListener.onProgressChanged(null,p,true);return true;} case MotionEvent.ACTION_UP: case MotionEvent.ACTION_CANCEL:if(mListener!=null)mListener.onStopTrackingTouch(null);return true; } return false; } }
     static class VuMeterView extends View { private static final int N=30; private static final float MIN_DB=-60f; private static final long PEAK_HOLD_MS=1800; private Paint mSegPaint=new Paint(1),mPeakPaint=new Paint(1),mDbLblPaint=new Paint(1); private RectF mRect=new RectF(); private float mLevelDb=MIN_DB,mPeakDb=MIN_DB; private long mPeakHoldUntil=0; VuMeterView(Context c){ super(c); mPeakPaint.setColor(-1); mPeakPaint.setStrokeWidth(4f*c.getResources().getDisplayMetrics().density); mPeakPaint.setStyle(Paint.Style.STROKE); mDbLblPaint.setTextSize(5.5f*c.getResources().getDisplayMetrics().density); mDbLblPaint.setTextAlign(Paint.Align.RIGHT); mDbLblPaint.setAntiAlias(true); } void setLevel(float rms){mLevelDb=rms>1e-6f?Math.max(MIN_DB,(float)(20.0*Math.log10(rms))):MIN_DB;postInvalidate();} void setPeak(float peak){float db=peak>1e-6f?Math.max(MIN_DB,(float)(20.0*Math.log10(peak))):MIN_DB;if(db>=mPeakDb||System.currentTimeMillis()>mPeakHoldUntil){mPeakDb=db;mPeakHoldUntil=System.currentTimeMillis()+PEAK_HOLD_MS;}} @Override protected void onDraw(Canvas g){ float w=getWidth(),h=getHeight(),segH=(h-N-1f)/N,segW=w-2f; for(int i=0;i<N;i++){ float segDb=MIN_DB+(float)i/N*(-MIN_DB); boolean lit=mLevelDb>=segDb; int color; if(!lit)color=0xFF181818; else if(segDb<-12f)color=0xFF00CC55; else if(segDb<-6f)color=0xFFFFBB00; else color=0xFFFF2200; mSegPaint.setColor(color); float y=h-1f-i*(segH+1f)-segH; mRect.set(1f,y,1f+segW,y+segH); g.drawRoundRect(mRect,2f,2f,mSegPaint); } if(mPeakDb>MIN_DB){ float frac=(mPeakDb-MIN_DB)/(-MIN_DB),py=h-1f-frac*(h-2f); long now=System.currentTimeMillis(); int pc; if(mPeakDb>=-3f)pc=0xFFFF2200; else if(mPeakDb>=-12f)pc=0xFFFFBB00; else pc=0xFF00FF88; boolean fading=now>mPeakHoldUntil-400; if(!fading||(now/150)%2==0){mPeakPaint.setColor(pc);g.drawLine(0,py,w,py,mPeakPaint);} } float[] dbMarks={0f,-6f,-12f,-24f,-48f,-60f}; String[] dbStrs={"0","-6","-12","-24","-48","-60"}; float lblAscent=-mDbLblPaint.ascent(); for(int di=0;di<dbMarks.length;di++){ float frac=(dbMarks[di]-MIN_DB)/(-MIN_DB),ly=h-1f-frac*(h-2f); if(dbMarks[di]>=-6f)mDbLblPaint.setColor(0xFFFF6644); else if(dbMarks[di]>=-12f)mDbLblPaint.setColor(0xFFFFDD44); else mDbLblPaint.setColor(0xCCBBFFCC); mDbLblPaint.setAlpha(200); g.drawText(dbStrs[di],w-1f,ly+lblAscent*0.5f,mDbLblPaint); } } }
     static class ZoomLeverView extends View { interface Listener{void onLever(float pos);} private Listener mListener; private volatile float mPos=0f; private boolean mTracking=false; private float trkT,trkB,trkH,trkW,mid,cx; private Paint mTrackPaint=new Paint(1),mThumbPaint=new Paint(1),mMarkPaint=new Paint(1),mTextPaint=new Paint(1); ZoomLeverView(Context c){ super(c); mTrackPaint.setColor(0x55FFFFFF); mThumbPaint.setColor(0xFFFFFFFF); mMarkPaint.setColor(0xAAFFFFFF); mMarkPaint.setStyle(Paint.Style.STROKE); mMarkPaint.setStrokeWidth(1.5f*c.getResources().getDisplayMetrics().density); mTextPaint.setColor(0xCCFFFFFF); mTextPaint.setTextAlign(Paint.Align.CENTER); mTextPaint.setTextSize(11*c.getResources().getDisplayMetrics().density); setBackgroundColor(0x44000000); } void setListener(Listener l){mListener=l;} private void recalc(){float w=getWidth(),h=getHeight(),lblH=mTextPaint.getTextSize()+dp(4); trkT=lblH; trkB=h-lblH; trkH=trkB-trkT; trkW=dp(16); mid=(trkT+trkB)/2f; cx=w/2f;} @Override protected void onDraw(Canvas g){ recalc(); float h=getHeight(); RectF track=new RectF(cx-trkW/2f,trkT,cx+trkW/2f,trkB); g.drawRoundRect(track,dp(5),dp(5),mTrackPaint); g.drawLine(cx-trkW/2f-dp(6),mid,cx+trkW/2f+dp(6),mid,mMarkPaint); float thumbCY=mid-mPos*trkH/2f,thumbH=dp(28),thumbW=trkW+dp(12); mThumbPaint.setAlpha((int)(160+90*Math.abs(mPos))); g.drawRoundRect(new RectF(cx-thumbW/2f,thumbCY-thumbH/2f,cx+thumbW/2f,thumbCY+thumbH/2f),dp(6),dp(6),mThumbPaint); Paint.FontMetrics fm=mTextPaint.getFontMetrics(); float pad=mTextPaint.getTextSize()+dp(2); g.drawText("T+",cx,pad/2f-(fm.ascent+fm.descent)/2f,mTextPaint); g.drawText("W−",cx,h-pad/2f-fm.ascent,mTextPaint); } @Override public boolean onTouchEvent(MotionEvent e){ recalc(); switch(e.getAction()){ case MotionEvent.ACTION_DOWN: case MotionEvent.ACTION_MOVE: removeCallbacks(mSpring); mTracking=true; mPos=Math.max(-1f,Math.min(1f,(mid-e.getY())/(trkH/2f))); if(mListener!=null)mListener.onLever(mPos); invalidate(); return true; case MotionEvent.ACTION_UP: case MotionEvent.ACTION_CANCEL: mTracking=false; post(mSpring); return true; } return super.onTouchEvent(e); } private Runnable mSpring=new Runnable(){ @Override public void run(){ if(mTracking)return; mPos*=0.75f; if(mListener!=null)mListener.onLever(mPos); invalidate(); if(Math.abs(mPos)>0.01f)postDelayed(this,16); else{mPos=0f;if(mListener!=null)mListener.onLever(0f);invalidate();} } }; private int dp(int x){return Math.round(x*getResources().getDisplayMetrics().density);} }
