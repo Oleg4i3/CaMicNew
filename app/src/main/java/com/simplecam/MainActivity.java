@@ -1037,15 +1037,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		if (sess == null || dev == null || !mSurfaceReady)
 		return;
 		try {
-			// TEMPLATE_RECORD используется всегда — в т.ч. в режиме превью.
-			// Это критично для EIS: многие Camera2 HAL настраивают EIS-пайплайн
-			// для PRIV (encoder InputSurface) только при TEMPLATE_RECORD.
-			// При TEMPLATE_PREVIEW HAL трактует encoder как «вторичное превью»
-			// и применяет EIS-трансформ с неправильным origin-смещением, что
-			// приводит к обрезке стабилизированного видео сверху и справа (~30%).
-			// Так как шаблон не меняется при старте записи, AE не пересчитывается
-			// и яркость не прыгает — тот же эффект, что преследовал TEMPLATE_PREVIEW.
-			int tmpl = CameraDevice.TEMPLATE_RECORD;
+			// TEMPLATE_PREVIEW  — по умолчанию: AE не пересчитывается, нет прыжка яркости.
+			// TEMPLATE_RECORD   — когда включён EIS: ISP строит EIS-пайплайн
+			//   относительно видео-поверхности (encoder surface), а не превью.
+			//   Без этого стабилизатор отображает кроп в координатах SurfaceView
+			//   и encoder surface получает неправильно смещённый кадр — обрезание
+			//   ~30% справа и сверху. TEMPLATE_RECORD устраняет это: камера знает,
+			//   что главный выход — видео, и правильно масштабирует EIS-окно.
+			//   Прыжка яркости нет, т.к. сессия уже прогрета и AE сходится.
+			int tmpl = (mEisEnabled && mEisSupported)
+					? CameraDevice.TEMPLATE_RECORD
+					: CameraDevice.TEMPLATE_PREVIEW;
 			Surface preview = mSv.getHolder().getSurface();
 			CaptureRequest.Builder rb = dev.createCaptureRequest(tmpl);
 			rb.addTarget(preview);
@@ -1080,20 +1082,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					: CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF);
 			
 			if (mSensorRect != null) {
-				// Когда EIS активен при zoom=1, НЕ выставляем SCALER_CROP_REGION явно.
-				// HAL самостоятельно выбирает внутренний crop-регион с запасом ~10-20%
-				// для стабилизации. Явная установка crop = полный сенсор отменяет этот
-				// выбор: часть HAL в ответ применяет EIS-сдвиг от угла (0,0), а не от
-				// центра, что дополнительно смещает кадр в encoder-буфере.
-				// При zoom > 1 или EIS выключен — выставляем как обычно (центрированный crop).
-				boolean eisActive = mEisEnabled && mEisSupported;
-				if (mZoomLevel > 1.005f || !eisActive) {
-					int cropW = Math.max(1, (int) (mSensorRect.width() / mZoomLevel));
-					int cropH = Math.max(1, (int) (mSensorRect.height() / mZoomLevel));
-					int cropX = mSensorRect.left + (mSensorRect.width() - cropW) / 2;
-					int cropY = mSensorRect.top + (mSensorRect.height() - cropH) / 2;
-					rb.set(CaptureRequest.SCALER_CROP_REGION, new Rect(cropX, cropY, cropX + cropW, cropY + cropH));
-				}
+				int cropW = Math.max(1, (int) (mSensorRect.width() / mZoomLevel));
+				int cropH = Math.max(1, (int) (mSensorRect.height() / mZoomLevel));
+				int cropX = mSensorRect.left + (mSensorRect.width() - cropW) / 2;
+				int cropY = mSensorRect.top + (mSensorRect.height() - cropH) / 2;
+				rb.set(CaptureRequest.SCALER_CROP_REGION, new Rect(cropX, cropY, cropX + cropW, cropY + cropH));
 			}
 			sess.setRepeatingRequest(rb.build(), null, mCamHandler);
 			} catch (Exception ignored) {
