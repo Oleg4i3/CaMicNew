@@ -34,8 +34,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final float MAX_ZOOM_SPEED = 0.08f;
     private static final long EIS_LATENCY_US = 500_000L;
 
-    private SurfaceView mSv, mMonitorView;
-    private SurfaceHolder mMonitorHolder;
+    private SurfaceView mSv;
     private Spinner mSpinner;
     private VerticalSeekBar mSeekGain;
     private FocusDrumView mFocusDrum;
@@ -70,8 +69,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private volatile float mFocusValue = 0f;
     private float mMinFocusDist = 0f;
     private volatile boolean mEisEnabled = false, mEisSupported = false;
-    private MediaCodec mPreviewDecoder;
-    private volatile boolean mPreviewDecoderReady = false, mWaitingForSurface = false;
     private volatile boolean mRecording;
     private volatile float mGain = 1f;
     private volatile boolean mSoftClip = false;
@@ -90,21 +87,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private volatile boolean mAudRunning;
 
     private static class EncodedFrame {
-        final byte[] data;
-        final long pts;
-        final int flags;
-
+        final byte[] data; final long pts; final int flags;
         EncodedFrame(ByteBuffer src, MediaCodec.BufferInfo bi) {
-            data = new byte[bi.size];
-            src.position(bi.offset);
-            src.get(data, 0, bi.size);
-            pts = bi.presentationTimeUs;
-            flags = bi.flags;
+            data = new byte[bi.size]; src.position(bi.offset); src.get(data, 0, bi.size);
+            pts = bi.presentationTimeUs; flags = bi.flags;
         }
-
         boolean isKey() { return (flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0; }
     }
-
     private final ArrayDeque<EncodedFrame> mVidRing = new ArrayDeque<>(), mAudRing = new ArrayDeque<>();
     private final Object mVidRingLock = new Object(), mAudRingLock = new Object();
     private volatile int mVidWriteMode = 0, mAudWriteMode = 0;
@@ -117,11 +106,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private int mEvMin = -6, mEvMax = 6;
     private SeekBar mSeekEv;
     private TextView mTvEv;
-    private volatile byte[] mCachedVideoCsd = null;
 
     private final Runnable mZoomRunnable = new Runnable() {
-        @Override
-        public void run() {
+        @Override public void run() {
             float lever = mZoomLeverPos;
             if (Math.abs(lever) > 0.02f) {
                 float a = Math.abs(lever);
@@ -133,8 +120,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
     };
 
-    @Override
-    protected void onCreate(Bundle s) {
+    @Override protected void onCreate(Bundle s) {
         super.onCreate(s);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON | WindowManager.LayoutParams.FLAG_FULLSCREEN);
         mFocusAssistHandler = new Handler(Looper.getMainLooper());
@@ -143,23 +129,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         showAirplaneModeReminder();
         checkPerms();
     }
-
-    @Override
-    protected void onResume() { super.onResume(); }
-
-    @Override
-    protected void onPause() {
-        super.onPause();
-        if (mRecording) mRecording = false;
-    }
-
-    @Override
-    protected void onDestroy() {
+    @Override protected void onResume() { super.onResume(); }
+    @Override protected void onPause() { super.onPause(); if (mRecording) mRecording = false; }
+    @Override protected void onDestroy() {
         super.onDestroy();
         if (mCamHandler != null) mCamHandler.removeCallbacks(mZoomRunnable);
-        mVidLoopRunning = false;
-        stopAudio();
-        finalizeMuxer();
+        mVidLoopRunning = false; stopAudio(); finalizeMuxer();
         if (mVidEnc != null) { try { mVidEnc.stop(); mVidEnc.release(); } catch (Exception e) {} mVidEnc = null; }
         if (mEncSurface != null) { try { mEncSurface.release(); } catch (Exception e) {} mEncSurface = null; }
         try { if (mCapSess != null) mCapSess.close(); } catch (Exception ignored) {}
@@ -168,395 +143,172 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private View buildLayout() {
-        FrameLayout root = new FrameLayout(this);
-        root.setBackgroundColor(Color.BLACK);
-
+        FrameLayout root = new FrameLayout(this); root.setBackgroundColor(Color.BLACK);
         mSv = new SurfaceView(this) {
-            @Override
-            protected void onMeasure(int wMs, int hMs) {
+            @Override protected void onMeasure(int wMs, int hMs) {
                 int w = MeasureSpec.getSize(wMs), h = MeasureSpec.getSize(hMs);
                 int targetH = w * 9 / 16;
-                if (targetH > h) {
-                    int targetW = h * 16 / 9;
-                    super.onMeasure(MeasureSpec.makeMeasureSpec(targetW, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(h, MeasureSpec.EXACTLY));
-                } else {
-                    super.onMeasure(MeasureSpec.makeMeasureSpec(w, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(targetH, MeasureSpec.EXACTLY));
-                }
+                if (targetH > h) { int targetW = h * 16 / 9; super.onMeasure(MeasureSpec.makeMeasureSpec(targetW, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(h, MeasureSpec.EXACTLY)); }
+                else super.onMeasure(MeasureSpec.makeMeasureSpec(w, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(targetH, MeasureSpec.EXACTLY));
             }
         };
         mSv.getHolder().addCallback(this);
         root.addView(mSv, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.CENTER));
 
-        mMonitorView = new SurfaceView(this);
-        mMonitorView.setZOrderMediaOverlay(true);
-        mMonitorView.setBackgroundColor(Color.RED);
-        FrameLayout.LayoutParams monLP = new FrameLayout.LayoutParams(dp(110), dp(80));
-        monLP.gravity = Gravity.TOP | Gravity.RIGHT;
-        monLP.topMargin = dp(10);
-        monLP.rightMargin = dp(10);
-        root.addView(mMonitorView, monLP);
-        mMonitorHolder = mMonitorView.getHolder();
-        mMonitorHolder.addCallback(new SurfaceHolder.Callback() {
-            @Override
-            public void surfaceCreated(SurfaceHolder h) { if (mWaitingForSurface) startPreviewDecoderIfNeeded(); }
-
-            @Override
-            public void surfaceChanged(SurfaceHolder h, int f, int w, int h2) {}
-
-            @Override
-            public void surfaceDestroyed(SurfaceHolder h) {
-                if (mPreviewDecoder != null) {
-                    try { mPreviewDecoder.stop(); mPreviewDecoder.release(); } catch (Exception e) {}
-                    mPreviewDecoder = null;
-                }
-                mPreviewDecoderReady = false;
-                mWaitingForSurface = true;
-            }
-        });
-        mMonitorView.setVisibility(View.GONE);
-
         mOscilloscope = new OscilloscopeView(this);
         FrameLayout.LayoutParams oscLP = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(130));
-        oscLP.gravity = Gravity.TOP | Gravity.LEFT;
-        oscLP.leftMargin = dp(50); oscLP.rightMargin = dp(60); oscLP.topMargin = dp(6);
+        oscLP.gravity = Gravity.TOP | Gravity.LEFT; oscLP.leftMargin = dp(50); oscLP.rightMargin = dp(60); oscLP.topMargin = dp(6);
         root.addView(mOscilloscope, oscLP); mOscilloscope.setVisibility(View.GONE);
 
         mEnvelope = new EnvelopeView(this);
         FrameLayout.LayoutParams envLP = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(130));
-        envLP.gravity = Gravity.TOP | Gravity.LEFT;
-        envLP.leftMargin = dp(50); envLP.rightMargin = dp(60); envLP.topMargin = dp(6);
+        envLP.gravity = Gravity.TOP | Gravity.LEFT; envLP.leftMargin = dp(50); envLP.rightMargin = dp(60); envLP.topMargin = dp(6);
         root.addView(mEnvelope, envLP);
 
-        mBtnBgIdle = makeOval(0xFFDDCC00);
-        mBtnBgRec = makeOval(0xFFCC1100);
-        mBtnBgPause = makeOval(0xFF1155CC);
+        mBtnBgIdle = makeOval(0xFFDDCC00); mBtnBgRec = makeOval(0xFFCC1100); mBtnBgPause = makeOval(0xFF1155CC);
 
-        LinearLayout outer = new LinearLayout(this);
-        outer.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout outer = new LinearLayout(this); outer.setOrientation(LinearLayout.VERTICAL);
         root.addView(outer, mp_mp());
-
         FrameLayout content = new FrameLayout(this);
         outer.addView(content, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
-        mSeekGain = new VerticalSeekBar(this);
-        mSeekGain.setMax(800);
-        mSeekGain.setProgress(400);
+        mSeekGain = new VerticalSeekBar(this); mSeekGain.setMax(800); mSeekGain.setProgress(400);
         mSeekGain.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            public void onProgressChanged(SeekBar s, int p, boolean u) {
-                float db = -20f + p * 40f / 800f;
-                mGain = (float) Math.pow(10.0, db / 20.0);
-                if (mTvGain != null) mTvGain.setText(String.format("%+.1f", db) + "dB");
-            }
-            public void onStartTrackingTouch(SeekBar s) {}
-            public void onStopTrackingTouch(SeekBar s) {}
+            public void onProgressChanged(SeekBar s, int p, boolean u) { float db = -20f + p * 40f / 800f; mGain = (float) Math.pow(10.0, db / 20.0); if (mTvGain != null) mTvGain.setText(String.format("%+.1f", db) + "dB"); }
+            public void onStartTrackingTouch(SeekBar s) {} public void onStopTrackingTouch(SeekBar s) {}
         });
         root.addView(mSeekGain, new FrameLayout.LayoutParams(dp(44), ViewGroup.LayoutParams.MATCH_PARENT, Gravity.LEFT));
 
         TextView tvGainLbl = smallLabel("GAIN");
         FrameLayout.LayoutParams gainLblLP = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.LEFT | Gravity.TOP);
-        gainLblLP.setMargins(dp(6), dp(4), 0, 0);
-        root.addView(tvGainLbl, gainLblLP);
+        gainLblLP.setMargins(dp(6), dp(4), 0, 0); root.addView(tvGainLbl, gainLblLP);
 
         mTvGain = smallLabel("+0.0dB");
         FrameLayout.LayoutParams gainValLP = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.LEFT | Gravity.BOTTOM);
-        gainValLP.setMargins(dp(3), 0, 0, dp(169));
-        root.addView(mTvGain, gainValLP);
+        gainValLP.setMargins(dp(3), 0, 0, dp(169)); root.addView(mTvGain, gainValLP);
 
         mVu = new VuMeterView(this);
         FrameLayout.LayoutParams vuVertLP = new FrameLayout.LayoutParams(dp(14), ViewGroup.LayoutParams.MATCH_PARENT, Gravity.LEFT);
-        vuVertLP.setMargins(dp(44), 0, 0, 0);
-        root.addView(mVu, vuVertLP);
+        vuVertLP.setMargins(dp(44), 0, 0, 0); root.addView(mVu, vuVertLP);
 
-        LinearLayout rightCol = new LinearLayout(this);
-        rightCol.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout rightCol = new LinearLayout(this); rightCol.setOrientation(LinearLayout.HORIZONTAL);
         root.addView(rightCol, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.RIGHT));
 
-        mFocusColumn = buildFocusColumn();
-        mFocusColumn.setVisibility(View.GONE);
+        mFocusColumn = buildFocusColumn(); mFocusColumn.setVisibility(View.GONE);
         rightCol.addView(mFocusColumn, new LinearLayout.LayoutParams(dp(44), ViewGroup.LayoutParams.MATCH_PARENT));
 
-        mZoomLever = new ZoomLeverView(this);
-        mZoomLever.setListener(pos -> mZoomLeverPos = pos);
+        mZoomLever = new ZoomLeverView(this); mZoomLever.setListener(pos -> mZoomLeverPos = pos);
         rightCol.addView(mZoomLever, new LinearLayout.LayoutParams(dp(54), ViewGroup.LayoutParams.MATCH_PARENT));
 
-        LinearLayout panel = new LinearLayout(this);
-        panel.setOrientation(LinearLayout.VERTICAL);
-        panel.setBackgroundColor(0x00000000);
-        panel.setPadding(dp(62), dp(2), dp(8), dp(3));
+        LinearLayout panel = new LinearLayout(this); panel.setOrientation(LinearLayout.VERTICAL); panel.setBackgroundColor(0x00000000); panel.setPadding(dp(62), dp(2), dp(8), dp(3));
         outer.addView(panel, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        mSrcToggleBtn = new Button(this);
-        mSrcToggleBtn.setText("⚙");
-        mSrcToggleBtn.setAllCaps(false);
-        mSrcToggleBtn.setTextSize(28);
-        mSrcToggleBtn.setTextColor(0xFFBBBBBB);
-        mSrcToggleBtn.setBackground(null);
-        mSrcToggleBtn.setPadding(0, 0, dp(8), 0);
-        mSrcToggleBtn.setOnClickListener(v -> {
-            mAudioSrcExpanded = !mAudioSrcExpanded;
-            mAudioSrcPanel.setVisibility(mAudioSrcExpanded ? View.VISIBLE : View.GONE);
-            mSrcToggleBtn.setText(mAudioSrcExpanded ? "⚙ ▴" : "⚙");
-        });
+        mSrcToggleBtn = new Button(this); mSrcToggleBtn.setText("⚙"); mSrcToggleBtn.setAllCaps(false); mSrcToggleBtn.setTextSize(28); mSrcToggleBtn.setTextColor(0xFFBBBBBB); mSrcToggleBtn.setBackground(null); mSrcToggleBtn.setPadding(0, 0, dp(8), 0);
+        mSrcToggleBtn.setOnClickListener(v -> { mAudioSrcExpanded = !mAudioSrcExpanded; mAudioSrcPanel.setVisibility(mAudioSrcExpanded ? View.VISIBLE : View.GONE); mSrcToggleBtn.setText(mAudioSrcExpanded ? "⚙ ▴" : "⚙"); });
+        mTvStatus = new TextView(this); mTvStatus.setTextColor(0xFFAAAAAA); mTvStatus.setTextSize(11); mTvStatus.setText("Ready"); mTvStatus.setSingleLine(false); mTvStatus.setMaxLines(2);
+        mTvStatus.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)); panel.addView(hrow(mSrcToggleBtn, mTvStatus));
 
-        mTvStatus = new TextView(this);
-        mTvStatus.setTextColor(0xFFAAAAAA);
-        mTvStatus.setTextSize(11);
-        mTvStatus.setText("Ready");
-        mTvStatus.setSingleLine(false);
-        mTvStatus.setMaxLines(2);
-        mTvStatus.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        panel.addView(hrow(mSrcToggleBtn, mTvStatus));
-
-        mAudioSrcPanel = new LinearLayout(this);
-        mAudioSrcPanel.setOrientation(LinearLayout.VERTICAL);
-        mAudioSrcPanel.setVisibility(View.GONE);
-        mAudioSrcPanel.setPadding(dp(8), dp(4), dp(8), dp(4));
-
+        mAudioSrcPanel = new LinearLayout(this); mAudioSrcPanel.setOrientation(LinearLayout.VERTICAL); mAudioSrcPanel.setVisibility(View.GONE); mAudioSrcPanel.setPadding(dp(8), dp(4), dp(8), dp(4));
         mSpinner = new Spinner(this);
-        ArrayAdapter<String> ad = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, new ArrayList<>());
-        ad.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-        mSpinner.setAdapter(ad);
+        ArrayAdapter<String> ad = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, new ArrayList<>()); ad.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item); mSpinner.setAdapter(ad);
         mSpinner.setLayoutParams(new LinearLayout.LayoutParams(dp(200), ViewGroup.LayoutParams.WRAP_CONTENT));
         mSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-            @Override
-            public void onItemSelected(AdapterView<?> p, View v, int pos, long id) { if (!mRecording) { stopAudio(); startMonitor(); } }
-            @Override
-            public void onNothingSelected(AdapterView<?> p) {}
+            @Override public void onItemSelected(AdapterView<?> p, View v, int pos, long id) { if (!mRecording) { stopAudio(); startMonitor(); } }
+            @Override public void onNothingSelected(AdapterView<?> p) {}
         });
+        LinearLayout srcRow = new LinearLayout(this); srcRow.setOrientation(LinearLayout.HORIZONTAL); srcRow.setGravity(Gravity.CENTER_VERTICAL); srcRow.addView(smallLabel("Src: ")); srcRow.addView(mSpinner); mAudioSrcPanel.addView(srcRow);
 
-        LinearLayout srcRow = new LinearLayout(this);
-        srcRow.setOrientation(LinearLayout.HORIZONTAL);
-        srcRow.setGravity(Gravity.CENTER_VERTICAL);
-        srcRow.addView(smallLabel("Src: "));
-        srcRow.addView(mSpinner);
-        mAudioSrcPanel.addView(srcRow);
-
-        mCbSoftClip = new CheckBox(this);
-        mCbSoftClip.setText("Soft clip");
-        mCbSoftClip.setTextColor(0xCCCCCCCC);
-        mCbSoftClip.setTextSize(12);
-        mCbSoftClip.setChecked(true);
-        mSoftClip = true;
+        mCbSoftClip = new CheckBox(this); mCbSoftClip.setText("Soft clip"); mCbSoftClip.setTextColor(0xCCCCCCCC); mCbSoftClip.setTextSize(12); mCbSoftClip.setChecked(true); mSoftClip = true;
         mCbSoftClip.setOnCheckedChangeListener((cb, checked) -> mSoftClip = checked);
+        mCbManualFocus = new CheckBox(this); mCbManualFocus.setText("Manual focus"); mCbManualFocus.setTextColor(0xCCCCCCCC); mCbManualFocus.setTextSize(12);
+        mCbManualFocus.setOnCheckedChangeListener((cb, checked) -> { mManualFocus = checked; mFocusColumn.setVisibility(checked ? View.VISIBLE : View.GONE); if (mCbFocusAssist != null) mCbFocusAssist.setVisibility(checked ? View.VISIBLE : View.GONE); if (!checked && mFocusAssistHandler != null) mFocusAssistHandler.removeCallbacksAndMessages(null); if (mCamHandler != null) mCamHandler.post(this::buildAndSendRequest); });
+        LinearLayout cbRow = new LinearLayout(this); cbRow.setOrientation(LinearLayout.HORIZONTAL); cbRow.setGravity(Gravity.CENTER_VERTICAL); cbRow.addView(mCbSoftClip); cbRow.addView(mCbManualFocus); mAudioSrcPanel.addView(cbRow);
 
-        mCbManualFocus = new CheckBox(this);
-        mCbManualFocus.setText("Manual focus");
-        mCbManualFocus.setTextColor(0xCCCCCCCC);
-        mCbManualFocus.setTextSize(12);
-        mCbManualFocus.setOnCheckedChangeListener((cb, checked) -> {
-            mManualFocus = checked;
-            mFocusColumn.setVisibility(checked ? View.VISIBLE : View.GONE);
-            if (mCbFocusAssist != null) mCbFocusAssist.setVisibility(checked ? View.VISIBLE : View.GONE);
-            if (!checked && mFocusAssistHandler != null) mFocusAssistHandler.removeCallbacksAndMessages(null);
-            if (mCamHandler != null) mCamHandler.post(this::buildAndSendRequest);
-        });
+        mCbEis = new CheckBox(this); mCbEis.setText("HW EIS"); mCbEis.setTextColor(0xCCCCCCCC); mCbEis.setTextSize(12); mCbEis.setEnabled(false);
+        mCbEis.setOnCheckedChangeListener((cb, checked) -> { if (mRecording) { cb.setChecked(!checked); status("EIS нельзя изменить"); return; } mEisEnabled = checked; if (mCamHandler != null) mCamHandler.post(MainActivity.this::buildAndSendRequest); }); cbRow.addView(mCbEis);
 
-        LinearLayout cbRow = new LinearLayout(this);
-        cbRow.setOrientation(LinearLayout.HORIZONTAL);
-        cbRow.setGravity(Gravity.CENTER_VERTICAL);
-        cbRow.addView(mCbSoftClip);
-        cbRow.addView(mCbManualFocus);
-        mAudioSrcPanel.addView(cbRow);
-
-        mCbEis = new CheckBox(this);
-        mCbEis.setText("HW EIS");
-        mCbEis.setTextColor(0xCCCCCCCC);
-        mCbEis.setTextSize(12);
-        mCbEis.setEnabled(false);
-        mCbEis.setOnCheckedChangeListener((cb, checked) -> {
-            if (mRecording) { cb.setChecked(!checked); status("EIS нельзя изменить"); return; }
-            mEisEnabled = checked;
-            if (mCamHandler != null) mCamHandler.post(MainActivity.this::buildAndSendRequest);
-        });
-        cbRow.addView(mCbEis);
-
-        CheckBox mCbOsc = new CheckBox(this);
-        mCbOsc.setText("Oscilloscope");
-        mCbOsc.setTextColor(0xCCCCCCCC);
-        mCbOsc.setTextSize(12);
-        mCbOsc.setChecked(false);
-        mCbOsc.setOnCheckedChangeListener((cb, checked) -> {
-            if (mOscilloscope != null) mOscilloscope.setVisibility(checked ? View.VISIBLE : View.GONE);
-            if (mEnvelope != null) mEnvelope.setVisibility(checked ? View.GONE : View.VISIBLE);
-        });
-
-        CheckBox mCbSpec = new CheckBox(this);
-        mCbSpec.setText("Spectrum analyzer");
-        mCbSpec.setTextColor(0xCCCCCCCC);
-        mCbSpec.setTextSize(12);
-        mCbSpec.setChecked(true);
+        CheckBox mCbOsc = new CheckBox(this); mCbOsc.setText("Oscilloscope"); mCbOsc.setTextColor(0xCCCCCCCC); mCbOsc.setTextSize(12); mCbOsc.setChecked(false);
+        mCbOsc.setOnCheckedChangeListener((cb, checked) -> { if (mOscilloscope != null) mOscilloscope.setVisibility(checked ? View.VISIBLE : View.GONE); if (mEnvelope != null) mEnvelope.setVisibility(checked ? View.GONE : View.VISIBLE); });
+        CheckBox mCbSpec = new CheckBox(this); mCbSpec.setText("Spectrum analyzer"); mCbSpec.setTextColor(0xCCCCCCCC); mCbSpec.setTextSize(12); mCbSpec.setChecked(true);
         mCbSpec.setOnCheckedChangeListener((cb, checked) -> { if (mSpectrum != null) mSpectrum.setVisibility(checked ? View.VISIBLE : View.GONE); });
+        LinearLayout cbRow2 = new LinearLayout(this); cbRow2.setOrientation(LinearLayout.HORIZONTAL); cbRow2.setGravity(Gravity.CENTER_VERTICAL); cbRow2.addView(mCbOsc); cbRow2.addView(mCbSpec); mAudioSrcPanel.addView(cbRow2);
 
-        LinearLayout cbRow2 = new LinearLayout(this);
-        cbRow2.setOrientation(LinearLayout.HORIZONTAL);
-        cbRow2.setGravity(Gravity.CENTER_VERTICAL);
-        cbRow2.addView(mCbOsc);
-        cbRow2.addView(mCbSpec);
-        mAudioSrcPanel.addView(cbRow2);
+        mCbFocusAssist = new CheckBox(this); mCbFocusAssist.setText("Focus assist"); mCbFocusAssist.setTextColor(0xCCCCCCCC); mCbFocusAssist.setTextSize(12); mCbFocusAssist.setVisibility(View.GONE); mAudioSrcPanel.addView(mCbFocusAssist);
 
-        mCbFocusAssist = new CheckBox(this);
-        mCbFocusAssist.setText("Focus assist");
-        mCbFocusAssist.setTextColor(0xCCCCCCCC);
-        mCbFocusAssist.setTextSize(12);
-        mCbFocusAssist.setVisibility(View.GONE);
-        mAudioSrcPanel.addView(mCbFocusAssist);
-
-        mTvEv = smallLabel("EV  0");
-        mSeekEv = new SeekBar(this);
-        mSeekEv.setMax(mEvMax - mEvMin);
-        mSeekEv.setProgress(-mEvMin);
+        mTvEv = smallLabel("EV  0"); mSeekEv = new SeekBar(this); mSeekEv.setMax(mEvMax - mEvMin); mSeekEv.setProgress(-mEvMin);
         mSeekEv.setLayoutParams(new LinearLayout.LayoutParams(dp(160), ViewGroup.LayoutParams.WRAP_CONTENT));
         mSeekEv.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             public void onProgressChanged(SeekBar s, int p, boolean u) { mEvComp = mEvMin + p; updateEvLabel(mEvComp); if (mCamHandler != null) mCamHandler.post(MainActivity.this::buildAndSendRequest); }
-            public void onStartTrackingTouch(SeekBar s) {}
-            public void onStopTrackingTouch(SeekBar s) {}
+            public void onStartTrackingTouch(SeekBar s) {} public void onStopTrackingTouch(SeekBar s) {}
         });
-        LinearLayout evRow = new LinearLayout(this);
-        evRow.setOrientation(LinearLayout.HORIZONTAL);
-        evRow.setGravity(Gravity.CENTER_VERTICAL);
-        evRow.addView(mTvEv);
-        evRow.addView(mSeekEv);
-        mAudioSrcPanel.addView(evRow);
+        LinearLayout evRow = new LinearLayout(this); evRow.setOrientation(LinearLayout.HORIZONTAL); evRow.setGravity(Gravity.CENTER_VERTICAL); evRow.addView(mTvEv); evRow.addView(mSeekEv); mAudioSrcPanel.addView(evRow);
 
-        CheckBox cbPB = new CheckBox(this);
-        cbPB.setText("Pre-buffer");
-        cbPB.setTextColor(0xCCCCCCCC);
-        cbPB.setTextSize(12);
-        cbPB.setChecked(true);
-        cbPB.setOnCheckedChangeListener((cb, on) -> mPreBufferEnabled = on);
-        final TextView tvPBLen = smallLabel("1 s");
-        SeekBar sbPB = new SeekBar(this);
-        sbPB.setMax(4);
-        sbPB.setProgress(0);
+        CheckBox cbPB = new CheckBox(this); cbPB.setText("Pre-buffer"); cbPB.setTextColor(0xCCCCCCCC); cbPB.setTextSize(12); cbPB.setChecked(true); cbPB.setOnCheckedChangeListener((cb, on) -> mPreBufferEnabled = on);
+        final TextView tvPBLen = smallLabel("1 s"); SeekBar sbPB = new SeekBar(this); sbPB.setMax(4); sbPB.setProgress(0);
         sbPB.setLayoutParams(new LinearLayout.LayoutParams(dp(110), ViewGroup.LayoutParams.WRAP_CONTENT));
         sbPB.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             public void onProgressChanged(SeekBar s, int p, boolean u) { mPreBufSecs = p + 1; tvPBLen.setText(mPreBufSecs + " s"); }
-            public void onStartTrackingTouch(SeekBar s) {}
-            public void onStopTrackingTouch(SeekBar s) {}
+            public void onStartTrackingTouch(SeekBar s) {} public void onStopTrackingTouch(SeekBar s) {}
         });
-        LinearLayout pbRow = new LinearLayout(this);
-        pbRow.setOrientation(LinearLayout.HORIZONTAL);
-        pbRow.setGravity(Gravity.CENTER_VERTICAL);
-        pbRow.addView(cbPB);
-        pbRow.addView(sbPB);
-        pbRow.addView(tvPBLen);
-        mAudioSrcPanel.addView(pbRow);
+        LinearLayout pbRow = new LinearLayout(this); pbRow.setOrientation(LinearLayout.HORIZONTAL); pbRow.setGravity(Gravity.CENTER_VERTICAL); pbRow.addView(cbPB); pbRow.addView(sbPB); pbRow.addView(tvPBLen); mAudioSrcPanel.addView(pbRow);
 
         String[] bpsL = {"500 kbps", "1 Mbps", "2 Mbps", "3 Mbps", "4 Mbps", "6 Mbps (def)", "8 Mbps", "12 Mbps"};
         int[] bpsV = {500_000, 1_000_000, 2_000_000, 3_000_000, 4_000_000, 6_000_000, 8_000_000, 12_000_000};
-        Spinner spBps = new Spinner(this);
-        ArrayAdapter<String> bpsAd = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, bpsL);
-        bpsAd.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-        spBps.setAdapter(bpsAd);
-        spBps.setSelection(5);
+        Spinner spBps = new Spinner(this); ArrayAdapter<String> bpsAd = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, bpsL); bpsAd.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item); spBps.setAdapter(bpsAd); spBps.setSelection(5);
         spBps.setLayoutParams(new LinearLayout.LayoutParams(dp(190), ViewGroup.LayoutParams.WRAP_CONTENT));
         spBps.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
             public void onItemSelected(AdapterView<?> p, View v, int pos, long id) { mVideoBps = bpsV[pos]; }
             public void onNothingSelected(AdapterView<?> p) {}
         });
-        LinearLayout bpsRow = new LinearLayout(this);
-        bpsRow.setOrientation(LinearLayout.HORIZONTAL);
-        bpsRow.setGravity(Gravity.CENTER_VERTICAL);
-        bpsRow.addView(smallLabel("Bps: "));
-        bpsRow.addView(spBps);
-        mAudioSrcPanel.addView(bpsRow);
+        LinearLayout bpsRow = new LinearLayout(this); bpsRow.setOrientation(LinearLayout.HORIZONTAL); bpsRow.setGravity(Gravity.CENTER_VERTICAL); bpsRow.addView(smallLabel("Bps: ")); bpsRow.addView(spBps); mAudioSrcPanel.addView(bpsRow);
         panel.addView(mAudioSrcPanel);
 
         mSpectrum = new SpectrumView(this);
-        LinearLayout.LayoutParams specLP = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(72));
-        specLP.rightMargin = dp(120);
-        panel.addView(mSpectrum, specLP);
+        LinearLayout.LayoutParams specLP = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(72)); specLP.rightMargin = dp(120); panel.addView(mSpectrum, specLP);
 
         int recSize = dp(68), recRight = dp(62), recBottom = dp(8);
-        mBtn = new Button(this);
-        mBtn.setText("REC");
-        mBtn.setTextColor(Color.WHITE);
-        mBtn.setTextSize(13);
-        mBtn.setBackground(mBtnBgIdle);
-        mBtn.setOnClickListener(v -> onRecordClick());
-        FrameLayout.LayoutParams recLP = new FrameLayout.LayoutParams(recSize, recSize);
-        recLP.gravity = Gravity.BOTTOM | Gravity.RIGHT;
-        recLP.rightMargin = recRight;
-        recLP.bottomMargin = recBottom;
-        root.addView(mBtn, recLP);
-
-        mBtnPause = new Button(this);
-        mBtnPause.setText("⏸");
-        mBtnPause.setTextColor(Color.WHITE);
-        mBtnPause.setTextSize(16);
-        mBtnPause.setBackground(mBtnBgPause);
-        mBtnPause.setVisibility(View.GONE);
-        mBtnPause.setOnClickListener(v -> onPauseClick());
-        FrameLayout.LayoutParams pauseLP = new FrameLayout.LayoutParams(dp(44), dp(44));
-        pauseLP.gravity = Gravity.BOTTOM | Gravity.RIGHT;
-        pauseLP.rightMargin = recRight + (recSize - dp(44)) / 2;
-        pauseLP.bottomMargin = recBottom + recSize + dp(6);
-        root.addView(mBtnPause, pauseLP);
+        mBtn = new Button(this); mBtn.setText("REC"); mBtn.setTextColor(Color.WHITE); mBtn.setTextSize(13); mBtn.setBackground(mBtnBgIdle); mBtn.setOnClickListener(v -> onRecordClick());
+        FrameLayout.LayoutParams recLP = new FrameLayout.LayoutParams(recSize, recSize); recLP.gravity = Gravity.BOTTOM | Gravity.RIGHT; recLP.rightMargin = recRight; recLP.bottomMargin = recBottom; root.addView(mBtn, recLP);
+        mBtnPause = new Button(this); mBtnPause.setText("⏸"); mBtnPause.setTextColor(Color.WHITE); mBtnPause.setTextSize(16); mBtnPause.setBackground(mBtnBgPause); mBtnPause.setVisibility(View.GONE); mBtnPause.setOnClickListener(v -> onPauseClick());
+        FrameLayout.LayoutParams pauseLP = new FrameLayout.LayoutParams(dp(44), dp(44)); pauseLP.gravity = Gravity.BOTTOM | Gravity.RIGHT; pauseLP.rightMargin = recRight + (recSize - dp(44)) / 2; pauseLP.bottomMargin = recBottom + recSize + dp(6); root.addView(mBtnPause, pauseLP);
 
         return root;
     }
 
     private View buildFocusColumn() {
-        FrameLayout col = new FrameLayout(this);
-        col.setBackgroundColor(0x33000000);
+        FrameLayout col = new FrameLayout(this); col.setBackgroundColor(0x33000000);
         mFocusDrum = new FocusDrumView(this);
-        mFocusDrum.setOnFocusChangeListener(v -> {
-            mFocusValue = v;
-            updateFocusLabel(v);
-            if (mManualFocus && mCamHandler != null) mCamHandler.post(MainActivity.this::buildAndSendRequest);
-        });
+        mFocusDrum.setOnFocusChangeListener(v -> { mFocusValue = v; updateFocusLabel(v); if (mManualFocus && mCamHandler != null) mCamHandler.post(MainActivity.this::buildAndSendRequest); });
         mFocusDrum.setOnDrumScrollListener(new FocusDrumView.OnDrumScrollListener() {
-            @Override
-            public void onScrollStart() {
-                if (mCbFocusAssist == null || !mCbFocusAssist.isChecked()) return;
-                mFocusAssistHandler.removeCallbacksAndMessages(null);
-                mSavedZoomBeforeAssist = mZoomLevel;
-                mZoomLevel = Math.min(mMaxZoom, Math.max(mZoomLevel * 3f, 4f));
-                if (mCamHandler != null) mCamHandler.post(MainActivity.this::buildAndSendRequest);
-            }
-            @Override
-            public void onScrollStop() {
-                if (mCbFocusAssist == null || !mCbFocusAssist.isChecked()) return;
-                mFocusAssistHandler.removeCallbacksAndMessages(null);
-                mFocusAssistHandler.postDelayed(() -> {
-                    mZoomLevel = mSavedZoomBeforeAssist;
-                    if (mCamHandler != null) mCamHandler.post(MainActivity.this::buildAndSendRequest);
-                }, 300);
-            }
+            @Override public void onScrollStart() { if (mCbFocusAssist == null || !mCbFocusAssist.isChecked()) return; mFocusAssistHandler.removeCallbacksAndMessages(null); mSavedZoomBeforeAssist = mZoomLevel; mZoomLevel = Math.min(mMaxZoom, Math.max(mZoomLevel * 3f, 4f)); if (mCamHandler != null) mCamHandler.post(MainActivity.this::buildAndSendRequest); }
+            @Override public void onScrollStop() { if (mCbFocusAssist == null || !mCbFocusAssist.isChecked()) return; mFocusAssistHandler.removeCallbacksAndMessages(null); mFocusAssistHandler.postDelayed(() -> { mZoomLevel = mSavedZoomBeforeAssist; if (mCamHandler != null) mCamHandler.post(MainActivity.this::buildAndSendRequest); }, 300); }
         });
         col.addView(mFocusDrum, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        TextView tvTop = smallLabel("∞");
-        FrameLayout.LayoutParams topLP = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.CENTER_HORIZONTAL);
-        topLP.setMargins(0, dp(4), 0, 0);
-        col.addView(tvTop, topLP);
-        TextView tvBot = smallLabel("▲");
-        FrameLayout.LayoutParams botLP = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
-        botLP.setMargins(0, 0, 0, dp(4));
-        col.addView(tvBot, botLP);
-        mTvFocus = smallLabel("∞");
-        col.addView(mTvFocus, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+        TextView tvTop = smallLabel("∞"); FrameLayout.LayoutParams topLP = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.CENTER_HORIZONTAL); topLP.setMargins(0, dp(4), 0, 0); col.addView(tvTop, topLP);
+        TextView tvBot = smallLabel("▲"); FrameLayout.LayoutParams botLP = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL); botLP.setMargins(0, 0, 0, dp(4)); col.addView(tvBot, botLP);
+        mTvFocus = smallLabel("∞"); col.addView(mTvFocus, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
         return col;
     }
 
-    private void updateFocusLabel(float v) { if (mTvFocus == null) return; String t = v < 0.005f ? "∞" : String.format("%.1f", v * mMinFocusDist) + "m⁻¹"; mTvFocus.setText(t); }
+    private void updateFocusLabel(float v) { if (mTvFocus == null) return; mTvFocus.setText(v < 0.005f ? "∞" : String.format("%.1f", v * mMinFocusDist) + "m⁻¹"); }
     private void updateEvLabel(int ev) { if (mTvEv == null) return; runOnUiThread(() -> mTvEv.setText(ev == 0 ? "EV  0" : String.format("EV %+d", ev))); }
     private GradientDrawable makeOval(int c) { GradientDrawable d = new GradientDrawable(); d.setShape(GradientDrawable.OVAL); d.setColor(c); return d; }
     private TextView smallLabel(String t) { TextView v = new TextView(this); v.setText(t); v.setTextColor(0xCCCCCCCC); v.setTextSize(11); v.setBackgroundColor(0x88000000); v.setPadding(dp(3), dp(1), dp(3), dp(1)); return v; }
     private LinearLayout hrow(View... views) { LinearLayout ll = new LinearLayout(this); ll.setOrientation(LinearLayout.HORIZONTAL); ll.setGravity(Gravity.CENTER_VERTICAL); LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT); lp.bottomMargin = dp(2); ll.setLayoutParams(lp); for (View v : views) { if (v.getLayoutParams() == null) v.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)); ll.addView(v); } return ll; }
     private ViewGroup.LayoutParams mp_mp() { return new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT); }
     private int dp(int x) { return Math.round(x * getResources().getDisplayMetrics().density); }
-
-    private void showAirplaneModeReminder() { new android.app.AlertDialog.Builder(this).setTitle("\u2708 Airplane Mode recommended").setMessage("For distraction-free recording:\n\n\u2022 Turn on Airplane Mode\n\nThis prevents calls, notifications and Wi-Fi interruptions.\n\n(Screen stays on while app is open.)").setPositiveButton("Got it", null).setNeutralButton("Open Settings", (d, w) -> { try { startActivity(new android.content.Intent(android.provider.Settings.ACTION_AIRPLANE_MODE_SETTINGS)); } catch (Exception ignored) {} }).show(); }
-    private void checkPerms() { List<String> need = new ArrayList<>(); if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) need.add(Manifest.permission.CAMERA); if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) need.add(Manifest.permission.RECORD_AUDIO); if (need.isEmpty()) { mPermsOk = true; if (mSurfaceReady) openCamera(); } else requestPermissions(need.toArray(new String[0]), REQ_PERMS); }
-
-    @Override
-    public void onRequestPermissionsResult(int r, String[] p, int[] res) { for (int x : res) if (x != PackageManager.PERMISSION_GRANTED) { status("Permissions required"); return; } mPermsOk = true; if (mSurfaceReady) openCamera(); }
-    @Override
-    public void surfaceCreated(SurfaceHolder h) { mSurfaceReady = true; if (mPermsOk) openCamera(); }
-    @Override
-    public void surfaceChanged(SurfaceHolder h, int f, int w, int t) {}
-    @Override
-    public void surfaceDestroyed(SurfaceHolder h) { mSurfaceReady = false; }
+    private void showAirplaneModeReminder() { new android.app.AlertDialog.Builder(this).setTitle("\u2708 Airplane Mode recommended").setMessage("For distraction-free recording:\n\n\u2022 Turn on Airplane Mode\n\nThis prevents calls, notifications and Wi-Fi interruptions.\n\n(Screen will stay on while app is open.)").setPositiveButton("Got it", null).setNeutralButton("Open Settings", (d, w) -> { try { startActivity(new android.content.Intent(android.provider.Settings.ACTION_AIRPLANE_MODE_SETTINGS)); } catch (Exception ignored) {} }).show(); }
+    private void checkPerms() {
+        List<String> need = new ArrayList<>();
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) need.add(Manifest.permission.CAMERA);
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) need.add(Manifest.permission.RECORD_AUDIO);
+        if (need.isEmpty()) { mPermsOk = true; if (mSurfaceReady) openCamera(); }
+        else requestPermissions(need.toArray(new String[0]), REQ_PERMS);
+    }
+    @Override public void onRequestPermissionsResult(int req, String[] perms, int[] res) { for (int r : res) if (r != PackageManager.PERMISSION_GRANTED) { status("Permissions required"); return; } mPermsOk = true; if (mSurfaceReady) openCamera(); }
+    @Override public void surfaceCreated(SurfaceHolder h) { mSurfaceReady = true; if (mPermsOk) openCamera(); }
+    @Override public void surfaceChanged(SurfaceHolder h, int f, int w, int t) {}
+    @Override public void surfaceDestroyed(SurfaceHolder h) { mSurfaceReady = false; }
 
     @SuppressLint("MissingPermission")
     private void openCamera() {
@@ -580,21 +332,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
             if (camId == null) camId = mCamMgr.getCameraIdList()[0];
             mCamMgr.openCamera(camId, new CameraDevice.StateCallback() {
-                @Override
-                public void onOpened(CameraDevice d) {
-                    mCamDev = d;
-                    startPreview();
-                    buildAudioSources();
-                    mCamHandler.post(mZoomRunnable);
-                    runOnUiThread(() -> {
-                        if (mSeekEv != null) { mSeekEv.setMax(mEvMax - mEvMin); mSeekEv.setProgress(-mEvMin); updateEvLabel(0); }
-                        if (mCbEis != null) { mCbEis.setEnabled(mEisSupported); mCbEis.setText(mEisSupported ? "HW EIS" : "HW EIS (не поддерживается)"); if (!mEisSupported) { mCbEis.setChecked(false); mEisEnabled = false; } }
-                    });
-                }
-                @Override
-                public void onDisconnected(CameraDevice d) { d.close(); mCamDev = null; }
-                @Override
-                public void onError(CameraDevice d, int e) { d.close(); mCamDev = null; }
+                @Override public void onOpened(CameraDevice d) { mCamDev = d; startPreview(); buildAudioSources(); mCamHandler.post(mZoomRunnable); runOnUiThread(() -> { if (mSeekEv != null) { mSeekEv.setMax(mEvMax - mEvMin); mSeekEv.setProgress(-mEvMin); updateEvLabel(0); } if (mCbEis != null) { mCbEis.setEnabled(mEisSupported); mCbEis.setText(mEisSupported ? "HW EIS" : "HW EIS (не поддерживается)"); if (!mEisSupported) { mCbEis.setChecked(false); mEisEnabled = false; } } }); }
+                @Override public void onDisconnected(CameraDevice d) { d.close(); mCamDev = null; }
+                @Override public void onError(CameraDevice d, int e) { d.close(); mCamDev = null; }
             }, mCamHandler);
         } catch (Exception e) { status("openCamera: " + e.getMessage()); }
     }
@@ -605,31 +345,37 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         try {
             if (mCapSess != null) { mCapSess.close(); mCapSess = null; }
             Surface preview = mSv.getHolder().getSurface();
-            List<Surface> targets = new ArrayList<>();
-            targets.add(preview);
+            List<Surface> targets = new ArrayList<>(); targets.add(preview);
             if (mEncSurface != null && mEncSurface.isValid()) targets.add(mEncSurface);
             mCamDev.createCaptureSession(targets, new CameraCaptureSession.StateCallback() {
-                @Override
-                public void onConfigured(CameraCaptureSession s) { mCapSess = s; buildAndSendRequest(); }
-                @Override
-                public void onConfigureFailed(CameraCaptureSession s) { status("Session config failed"); }
+                @Override public void onConfigured(CameraCaptureSession s) { mCapSess = s; buildAndSendRequest(); }
+                @Override public void onConfigureFailed(CameraCaptureSession s) { status("Session config failed"); }
             }, mCamHandler);
         } catch (Exception e) { status("startPreview: " + e.getMessage()); }
     }
+	
+	    // Продолжение – методы камеры, аудио, запись и кастомные View
 
     private void buildAndSendRequest() {
-        CameraCaptureSession sess = mCapSess;
-        CameraDevice dev = mCamDev;
+        CameraCaptureSession sess = mCapSess; CameraDevice dev = mCamDev;
         if (sess == null || dev == null || !mSurfaceReady) return;
         try {
-            CaptureRequest.Builder rb = dev.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+            // При записи используем TEMPLATE_RECORD, как в HedgeCam
+            int template = mRecording ? CameraDevice.TEMPLATE_RECORD : CameraDevice.TEMPLATE_PREVIEW;
+            CaptureRequest.Builder rb = dev.createCaptureRequest(template);
             rb.addTarget(mSv.getHolder().getSurface());
             if (mEncSurface != null && mEncSurface.isValid()) rb.addTarget(mEncSurface);
-            if (mManualFocus) { rb.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF); rb.set(CaptureRequest.LENS_FOCUS_DISTANCE, mFocusValue * mMinFocusDist); }
-            else rb.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO);
+            if (mManualFocus) {
+                rb.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF);
+                rb.set(CaptureRequest.LENS_FOCUS_DISTANCE, mFocusValue * mMinFocusDist);
+            } else {
+                rb.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO);
+            }
             rb.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
             rb.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, mEvComp);
-            rb.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, (mEisEnabled && mEisSupported) ? CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON : CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF);
+            rb.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                    (mEisEnabled && mEisSupported) ? CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                            : CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF);
             if (mSensorRect != null) {
                 int cropW = Math.max(1, (int)(mSensorRect.width() / mZoomLevel));
                 int cropH = Math.max(1, (int)(mSensorRect.height() / mZoomLevel));
@@ -661,8 +407,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void onRecordClick() {
-        if (mRecording) { mRecording = false; mBtn.setEnabled(false); status("Stopping…"); new Thread(this::doStop).start(); }
-        else { mBtn.setEnabled(false); status("Starting…"); new Thread(this::doStart).start(); }
+        if (mRecording) {
+            mRecording = false; mBtn.setEnabled(false); status("Stopping…");
+            new Thread(this::doStop).start();
+        } else {
+            mBtn.setEnabled(false); status("Starting…");
+            new Thread(this::doStart).start();
+        }
     }
 
     private synchronized void ensureEncoders() {
@@ -679,49 +430,38 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 vf.setInteger(MediaFormat.KEY_LEVEL, CodecProfileLevel.AVCLevel31);
                 mVidEnc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
                 mVidEnc.configure(vf, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-                mEncSurface = mVidEnc.createInputSurface();
-                mVidEnc.start();
-                mVidOutFmt = null;
-                synchronized (mVidRingLock) { mVidRing.clear(); }
-                mVidWriteMode = 0;
-                mCachedVideoCsd = null;
+                mEncSurface = mVidEnc.createInputSurface(); mVidEnc.start();
+                mVidOutFmt = null; synchronized (mVidRingLock) { mVidRing.clear(); } mVidWriteMode = 0;
             } catch (Exception e) { status("VidEnc err: " + e.getMessage()); return; }
         }
-        if (!mVidLoopRunning) { Thread t = new Thread(this::videoPreviewLoop, "vid-preview"); t.setDaemon(true); t.start(); }
+        if (!mVidLoopRunning) {
+            Thread t = new Thread(this::videoPreviewLoop, "vid-preview"); t.setDaemon(true); t.start();
+        }
     }
 
     private void videoPreviewLoop() {
         mVidLoopRunning = true;
         MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
         while (mVidLoopRunning) {
-            MediaCodec enc = mVidEnc;
-            if (enc == null) { try { Thread.sleep(20); } catch (Exception e) {} continue; }
-            int out;
-            try { out = enc.dequeueOutputBuffer(info, 40_000); } catch (Exception e) { break; }
+            MediaCodec enc = mVidEnc; if (enc == null) { try { Thread.sleep(20); } catch (Exception e) {} continue; }
+            int out; try { out = enc.dequeueOutputBuffer(info, 40_000); } catch (Exception e) { break; }
             if (out == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) { synchronized (mVidRingLock) { mVidOutFmt = enc.getOutputFormat(); } continue; }
             if (out < 0) continue;
             try {
                 boolean cfg = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
-                if (cfg && info.size > 0) {
-                    ByteBuffer csdBuf = enc.getOutputBuffer(out);
-                    if (csdBuf != null) {
-                        byte[] csd = new byte[info.size];
-                        csdBuf.position(info.offset);
-                        csdBuf.get(csd, 0, info.size);
-                        mCachedVideoCsd = csd;
-                        if (mRecording && mPreviewDecoderReady && mPreviewDecoder != null) sendToPreviewDecoder(ByteBuffer.wrap(csd), info);
-                    }
-                }
                 if (cfg || info.size <= 0) continue;
-                ByteBuffer data = enc.getOutputBuffer(out);
-                if (data == null) continue;
+                ByteBuffer data = enc.getOutputBuffer(out); if (data == null) continue;
                 int mode = mVidWriteMode;
                 if (mode == 0) {
                     EncodedFrame f = new EncodedFrame(data, info);
                     synchronized (mVidRingLock) {
                         mVidRing.addLast(f);
                         long eisExtra = (mEisEnabled && mEisSupported) ? EIS_LATENCY_US : 0L;
-                        while (mVidRing.size() > 1) { long span = mVidRing.peekLast().pts - mVidRing.peekFirst().pts; if (span <= (long) mPreBufSecs * 1_200_000L + eisExtra) break; mVidRing.removeFirst(); }
+                        while (mVidRing.size() > 1) {
+                            long span = mVidRing.peekLast().pts - mVidRing.peekFirst().pts;
+                            if (span <= (long) mPreBufSecs * 1_200_000L + eisExtra) break;
+                            mVidRing.removeFirst();
+                        }
                     }
                 } else if (mode == 1) {
                     synchronized (mVidRingLock) {
@@ -733,47 +473,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                             MediaCodec.BufferInfo bi = new MediaCodec.BufferInfo();
                             bi.set(0, rf.data.length, rf.pts - mMuxBasePts, rf.flags);
                             synchronized (mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mVidTrack, rb, bi); }
-                            if (mPreviewDecoderReady && mPreviewDecoder != null) sendToPreviewDecoder(rb, bi);
                         }
                         mVidRing.clear();
                     }
                     MediaCodec.BufferInfo n = new MediaCodec.BufferInfo();
                     n.set(info.offset, info.size, info.presentationTimeUs - mMuxBasePts, info.flags);
                     synchronized (mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mVidTrack, data, n); }
-                    if (mPreviewDecoderReady && mPreviewDecoder != null) sendToPreviewDecoder(data, n);
                     mVidWriteMode = 2;
                 } else {
                     MediaCodec.BufferInfo n = new MediaCodec.BufferInfo();
                     n.set(info.offset, info.size, info.presentationTimeUs - mMuxBasePts, info.flags);
                     synchronized (mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mVidTrack, data, n); }
-                    if (mPreviewDecoderReady && mPreviewDecoder != null) sendToPreviewDecoder(data, n);
                 }
             } finally { enc.releaseOutputBuffer(out, false); }
         }
         mVidLoopRunning = false;
-    }
-
-    private void sendToPreviewDecoder(ByteBuffer src, MediaCodec.BufferInfo info) {
-        MediaCodec dec = mPreviewDecoder;
-        if (dec == null || !mPreviewDecoderReady) return;
-        int idx = dec.dequeueInputBuffer(10_000);
-        if (idx >= 0) {
-            ByteBuffer decIn = dec.getInputBuffer(idx);
-            if (decIn != null) {
-                decIn.clear();
-                int pos = src.position(), lim = src.limit();
-                src.position(info.offset); src.limit(info.offset + info.size);
-                decIn.put(src);
-                src.limit(lim); src.position(pos);
-                dec.queueInputBuffer(idx, 0, info.size, info.presentationTimeUs, info.flags);
-            }
-        }
-        drainPreviewDecoder(dec);
-    }
-
-    private void drainPreviewDecoder(MediaCodec dec) {
-        MediaCodec.BufferInfo i = new MediaCodec.BufferInfo();
-        while (true) { int o = dec.dequeueOutputBuffer(i, 0); if (o < 0) break; dec.releaseOutputBuffer(o, true); }
     }
 
     @SuppressLint("MissingPermission")
@@ -781,13 +495,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (mAudRunning || !mPermsOk) return;
         int pos = mSpinner.getSelectedItemPosition();
         AudioSrcItem s2 = (pos >= 0 && pos < mSrcList.size()) ? mSrcList.get(pos) : null;
-        int src = s2 != null ? s2.audioSource : MediaRecorder.AudioSource.MIC;
+        int audioSrc = s2 != null ? s2.audioSource : MediaRecorder.AudioSource.MIC;
         int chCfg = AudioFormat.CHANNEL_IN_STEREO, ch = 2;
         int minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chCfg, AudioFormat.ENCODING_PCM_16BIT);
         if (minBuf <= 0) { chCfg = AudioFormat.CHANNEL_IN_MONO; ch = 1; minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chCfg, AudioFormat.ENCODING_PCM_16BIT); }
         int bufSz = Math.max(minBuf, AUDIO_SR * ch * 2 / 5);
-        AudioRecord rec = new AudioRecord(src, AUDIO_SR, chCfg, AudioFormat.ENCODING_PCM_16BIT, bufSz);
-        if (rec.getState() != AudioRecord.STATE_INITIALIZED && ch == 2) { rec.release(); chCfg = AudioFormat.CHANNEL_IN_MONO; ch = 1; minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chCfg, AudioFormat.ENCODING_PCM_16BIT); bufSz = Math.max(minBuf, AUDIO_SR * 2 / 5); rec = new AudioRecord(src, AUDIO_SR, chCfg, AudioFormat.ENCODING_PCM_16BIT, bufSz); }
+        AudioRecord rec = new AudioRecord(audioSrc, AUDIO_SR, chCfg, AudioFormat.ENCODING_PCM_16BIT, bufSz);
+        if (rec.getState() != AudioRecord.STATE_INITIALIZED && ch == 2) {
+            rec.release(); chCfg = AudioFormat.CHANNEL_IN_MONO; ch = 1;
+            minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chCfg, AudioFormat.ENCODING_PCM_16BIT);
+            bufSz = Math.max(minBuf, AUDIO_SR * 2 / 5);
+            rec = new AudioRecord(audioSrc, AUDIO_SR, chCfg, AudioFormat.ENCODING_PCM_16BIT, bufSz);
+        }
         if (rec.getState() != AudioRecord.STATE_INITIALIZED) { rec.release(); return; }
         if (Build.VERSION.SDK_INT >= 23 && s2 != null && s2.device != null) rec.setPreferredDevice(s2.device);
         disableAudioEffects(rec.getAudioSessionId());
@@ -797,11 +516,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             af.setInteger(MediaFormat.KEY_BIT_RATE, ch == 1 ? 192_000 : 320_000);
             af.setInteger(MediaFormat.KEY_AAC_PROFILE, CodecProfileLevel.AACObjectLC);
             mAudEnc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC);
-            mAudEnc.configure(af, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-            mAudEnc.start();
-            mAudOutFmt = null;
-            synchronized (mAudRingLock) { mAudRing.clear(); }
-            mAudWriteMode = 0;
+            mAudEnc.configure(af, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE); mAudEnc.start();
+            mAudOutFmt = null; synchronized (mAudRingLock) { mAudRing.clear(); } mAudWriteMode = 0;
         } catch (Exception e) { status("AudEnc err: " + e.getMessage()); mAudEnc = null; }
         mAudRunning = true;
         mAudThread = new Thread(this::audioMainLoop, "aud-main"); mAudThread.setDaemon(true); mAudThread.start();
@@ -813,8 +529,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (mAudThread != null) { try { mAudThread.join(600); } catch (Exception ignored) {} mAudThread = null; }
         if (mAudRec != null) { try { mAudRec.release(); } catch (Exception ignored) {} mAudRec = null; }
         if (mAudEnc != null) { try { mAudEnc.stop(); mAudEnc.release(); } catch (Exception ignored) {} mAudEnc = null; }
-        mAudOutFmt = null;
-        synchronized (mAudRingLock) { mAudRing.clear(); }
+        mAudOutFmt = null; synchronized (mAudRingLock) { mAudRing.clear(); }
     }
 
     private void disableAudioEffects(int sid) {
@@ -824,9 +539,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void audioMainLoop() {
-        AudioRecord rec = mAudRec; int ch = mAudChannels; int chunkSamples = AUDIO_SR * ch / 50; short[] buf = new short[chunkSamples];
-        long startUs = System.nanoTime() / 1000L, totalFrames = 0L;
-        rec.startRecording();
+        AudioRecord rec = mAudRec; int ch = mAudChannels; int chunkSamples = AUDIO_SR * ch / 50;
+        short[] buf = new short[chunkSamples];
+        long startUs = System.nanoTime() / 1000L, totalFrames = 0L; rec.startRecording();
         while (mAudRunning) {
             int r = rec.read(buf, 0, chunkSamples); if (r <= 0) continue;
             float g = mGain; boolean sc = mSoftClip; long sumSq = 0;
@@ -875,29 +590,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
     }
 
-    private void startPreviewDecoderIfNeeded() {
-        if (mPreviewDecoder != null || mMonitorHolder == null || mMonitorHolder.getSurface() == null || !mRecording) return;
-        try {
-            MediaFormat df = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, VIDEO_W, VIDEO_H);
-            mPreviewDecoder = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
-            mPreviewDecoder.configure(df, mMonitorHolder.getSurface(), null, 0);
-            mPreviewDecoder.start();
-            byte[] csd = mCachedVideoCsd;
-            if (csd != null) {
-                int idx = mPreviewDecoder.dequeueInputBuffer(10000);
-                if (idx >= 0) { ByteBuffer ib = mPreviewDecoder.getInputBuffer(idx); if (ib != null) { ib.clear(); ib.put(csd); mPreviewDecoder.queueInputBuffer(idx, 0, csd.length, 0, MediaCodec.BUFFER_FLAG_CODEC_CONFIG); } }
-            }
-            mPreviewDecoderReady = true; mWaitingForSurface = false;
-        } catch (Exception e) { status("Preview decoder err: " + e.getMessage()); mPreviewDecoder = null; }
-    }
-
     @SuppressLint("MissingPermission")
     private void doStart() {
         try {
             for (int w = 0; w < 40 && (mVidOutFmt == null || mAudOutFmt == null); w++) Thread.sleep(50);
             if (mVidOutFmt == null || mAudOutFmt == null) { runOnUiThread(() -> { mBtn.setEnabled(true); status("Encoder not ready"); }); return; }
             long basePts;
-            synchronized (mVidRingLock) { if (mPreBufferEnabled) { basePts = Long.MAX_VALUE; for (EncodedFrame f : mVidRing) if (f.isKey()) { basePts = f.pts; break; } if (basePts == Long.MAX_VALUE) basePts = 0; } else basePts = System.nanoTime() / 1000L; }
+            synchronized (mVidRingLock) {
+                if (mPreBufferEnabled) {
+                    basePts = Long.MAX_VALUE;
+                    for (EncodedFrame f : mVidRing) if (f.isKey()) { basePts = f.pts; break; }
+                    if (basePts == Long.MAX_VALUE) basePts = 0;
+                } else basePts = System.nanoTime() / 1000L;
+            }
             mMuxBasePts = basePts;
             String displayPath;
             if (Build.VERSION.SDK_INT >= 29) {
@@ -913,17 +618,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             @SuppressWarnings("deprecation") int rot = getWindowManager().getDefaultDisplay().getRotation() * 90;
             mMuxer.setOrientationHint((mSensorOrientation - rot + 360) % 360);
             synchronized (mMuxLock) { mVidTrack = mMuxer.addTrack(mVidOutFmt); mAudTrack = mMuxer.addTrack(mAudOutFmt); mMuxer.start(); mMuxReady = true; }
-            mRecording = true;
-            if (mPreBufferEnabled) { mVidWriteMode = 1; mAudWriteMode = 1; } else { mVidWriteMode = 2; mAudWriteMode = 2; }
+            mRecording = true; if (mPreBufferEnabled) { mVidWriteMode = 1; mAudWriteMode = 1; } else { mVidWriteMode = 2; mAudWriteMode = 2; }
             final String fp = displayPath;
             runOnUiThread(() -> {
                 mBtn.setText("⏹ STOP"); mBtn.setBackground(mBtnBgRec); mBtn.setEnabled(true);
                 mBtnPause.setVisibility(View.VISIBLE); mBtnPause.setText("⏸"); mBtnPause.setBackground(mBtnBgPause); mPaused = false;
                 if (mCbEis != null) mCbEis.setEnabled(false);
-                if (mMonitorView != null) { mMonitorView.setVisibility(View.VISIBLE); if (mMonitorHolder.getSurface() != null && mMonitorHolder.getSurface().isValid()) startPreviewDecoderIfNeeded(); else mWaitingForSurface = true; }
                 status("● REC → " + fp);
             });
-        } catch (Exception e) { mRecording = false; mVidWriteMode = 0; mAudWriteMode = 0; finalizeMuxer(); runOnUiThread(() -> { mBtn.setText("⏺ REC"); mBtn.setBackground(mBtnBgIdle); mBtn.setEnabled(true); mBtnPause.setVisibility(View.GONE); if (mCbEis != null) mCbEis.setEnabled(mEisSupported); if (mMonitorView != null) mMonitorView.setVisibility(View.GONE); status("Error: " + e.getMessage()); }); }
+        } catch (Exception e) { mRecording = false; mVidWriteMode = 0; mAudWriteMode = 0; finalizeMuxer(); runOnUiThread(() -> { mBtn.setText("⏺ REC"); mBtn.setBackground(mBtnBgIdle); mBtn.setEnabled(true); mBtnPause.setVisibility(View.GONE); if (mCbEis != null) mCbEis.setEnabled(mEisSupported); status("Error: " + e.getMessage()); }); }
     }
 
     private void doStop() { try { Thread.sleep(200); } catch (Exception ignored) {} mVidWriteMode = 0; mAudWriteMode = 0; finalizeMuxer(); }
@@ -932,9 +635,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         synchronized (mMuxLock) { try { if (mMuxer != null) { if (mMuxReady) mMuxer.stop(); mMuxer.release(); } } catch (Exception ignored) {} mMuxer = null; mMuxReady = false; mVidTrack = -1; mAudTrack = -1; }
         try { if (mPfd != null) { mPfd.close(); mPfd = null; } } catch (Exception ignored) {}
         if (Build.VERSION.SDK_INT >= 29 && mPendingUri != null) { ContentValues cv = new ContentValues(); cv.put(MediaStore.Video.Media.IS_PENDING, 0); getContentResolver().update(mPendingUri, cv, null, null); mPendingUri = null; }
-        if (mPreviewDecoder != null) { try { mPreviewDecoder.stop(); mPreviewDecoder.release(); } catch (Exception ignored) {} mPreviewDecoder = null; }
-        mPreviewDecoderReady = false; mWaitingForSurface = false;
-        runOnUiThread(() -> { mBtn.setText("⏺ REC"); mBtn.setBackground(mBtnBgIdle); mBtn.setEnabled(true); mBtnPause.setVisibility(View.GONE); if (mCbEis != null) mCbEis.setEnabled(mEisSupported); if (mMonitorView != null) mMonitorView.setVisibility(View.GONE); mPaused = false; status("Saved"); });
+        runOnUiThread(() -> { mBtn.setText("⏺ REC"); mBtn.setBackground(mBtnBgIdle); mBtn.setEnabled(true); mBtnPause.setVisibility(View.GONE); if (mCbEis != null) mCbEis.setEnabled(mEisSupported); mPaused = false; status("Saved"); });
     }
 
     private void status(String s) { runOnUiThread(() -> mTvStatus.setText(s)); }
@@ -963,12 +664,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private static class AudioSrcItem { final String name; final int audioSource; final AudioDeviceInfo device; AudioSrcItem(String n, int s, AudioDeviceInfo d) { name = n; audioSource = s; device = d; } }
 
-static class VerticalSeekBar extends View { private int mMax=100,mProgress=0; private final Paint mTrackPaint=new Paint(Paint.ANTI_ALIAS_FLAG),mFillPaint=new Paint(Paint.ANTI_ALIAS_FLAG),mThumbPaint=new Paint(Paint.ANTI_ALIAS_FLAG),mRidgePaint=new Paint(Paint.ANTI_ALIAS_FLAG); private SeekBar.OnSeekBarChangeListener mListener; VerticalSeekBar(Context c){ super(c); mTrackPaint.setColor(0x44FFFFFF); mFillPaint.setColor(0xFFDDCC00); mThumbPaint.setColor(0xFFEEEEEE); mRidgePaint.setColor(0xFF888866); mRidgePaint.setStyle(Paint.Style.STROKE); mRidgePaint.setStrokeWidth(1.2f*c.getResources().getDisplayMetrics().density); setClickable(true); } void setMax(int m){mMax=m;invalidate();} void setProgress(int p){mProgress=Math.max(0,Math.min(mMax,p));invalidate();} int getMax(){return mMax;} int getProgress(){return mProgress;} void setOnSeekBarChangeListener(SeekBar.OnSeekBarChangeListener l){mListener=l;} private float faderH(float w){return Math.round(w*0.7f)+dp(20);} private int dp(int x){return Math.round(x*getResources().getDisplayMetrics().density);} @Override protected void onDraw(Canvas g){ float w=getWidth(),h=getHeight(),trackW=w*0.3f,cx=w/2f,trkX1=cx-trackW/2f,trkX2=cx+trackW/2f,halfFader=faderH(w)/2f,padV=halfFader+2f,trkT=padV,trkB=h-padV,trkH=trkB-trkT; float frac=mMax>0?(float)mProgress/mMax:0f,thumbY=trkB-frac*trkH; g.drawRoundRect(new RectF(trkX1,trkT,trkX2,trkB),trackW/2f,trackW/2f,mTrackPaint); g.drawRoundRect(new RectF(trkX1,thumbY,trkX2,trkB),trackW/2f,trackW/2f,mFillPaint); Paint z=new Paint(Paint.ANTI_ALIAS_FLAG);z.setColor(0x88FFFFFF);z.setStrokeWidth(1.5f); g.drawLine(trkX1-3f,trkB-0.5f*trkH,trkX2+3f,trkB-0.5f*trkH,z); float fH=faderH(w),fW=w-2f; RectF fader=new RectF(1f,thumbY-fH/2f,1f+fW,thumbY+fH/2f); Paint sh=new Paint(Paint.ANTI_ALIAS_FLAG);sh.setColor(0x66000000);sh.setStyle(Paint.Style.FILL); g.drawRoundRect(new RectF(fader.left+2,fader.top+3,fader.right+2,fader.bottom+3),dp(4),dp(4),sh); g.drawRoundRect(fader,dp(4),dp(4),mThumbPaint); float rInset=fW*0.18f; for(int ri=-1;ri<=1;ri++){float ry=thumbY+ri*dp(4);g.drawLine(1f+rInset,ry,1f+fW-rInset,ry,mRidgePaint);} Paint cL=new Paint(Paint.ANTI_ALIAS_FLAG);cL.setColor(0xFFDDCC00);cL.setStrokeWidth(1.5f); g.drawLine(1f+rInset*0.6f,thumbY,1f+fW-rInset*0.6f,thumbY,cL); } @Override public boolean onTouchEvent(MotionEvent e){ if(!isEnabled())return false; float h=getHeight(),w=getWidth(),halfFader=faderH(w)/2f,padV=halfFader+2f,trkT=padV,trkB=h-padV,trkH=trkB-trkT; switch(e.getAction()){ case MotionEvent.ACTION_DOWN:if(mListener!=null)mListener.onStartTrackingTouch(null); case MotionEvent.ACTION_MOVE:{float frac=1f-(e.getY()-trkT)/trkH;int p=Math.max(0,Math.min(mMax,Math.round(frac*mMax)));mProgress=p;invalidate();if(mListener!=null)mListener.onProgressChanged(null,p,true);return true;} case MotionEvent.ACTION_UP: case MotionEvent.ACTION_CANCEL:if(mListener!=null)mListener.onStopTrackingTouch(null);return true; } return false; } }
-static class VuMeterView extends View { private static final int N=30; private static final float MIN_DB=-60f; private static final long PEAK_HOLD_MS=1800; private Paint mSegPaint=new Paint(1),mPeakPaint=new Paint(1),mDbLblPaint=new Paint(1); private RectF mRect=new RectF(); private float mLevelDb=MIN_DB,mPeakDb=MIN_DB; private long mPeakHoldUntil=0; VuMeterView(Context c){ super(c); mPeakPaint.setColor(-1); mPeakPaint.setStrokeWidth(4f*c.getResources().getDisplayMetrics().density); mPeakPaint.setStyle(Paint.Style.STROKE); mDbLblPaint.setTextSize(5.5f*c.getResources().getDisplayMetrics().density); mDbLblPaint.setTextAlign(Paint.Align.RIGHT); mDbLblPaint.setAntiAlias(true); } void setLevel(float rms){mLevelDb=rms>1e-6f?Math.max(MIN_DB,(float)(20.0*Math.log10(rms))):MIN_DB;postInvalidate();} void setPeak(float peak){float db=peak>1e-6f?Math.max(MIN_DB,(float)(20.0*Math.log10(peak))):MIN_DB;if(db>=mPeakDb||System.currentTimeMillis()>mPeakHoldUntil){mPeakDb=db;mPeakHoldUntil=System.currentTimeMillis()+PEAK_HOLD_MS;}} @Override protected void onDraw(Canvas g){ float w=getWidth(),h=getHeight(),segH=(h-N-1f)/N,segW=w-2f; for(int i=0;i<N;i++){ float segDb=MIN_DB+(float)i/N*(-MIN_DB); boolean lit=mLevelDb>=segDb; int color; if(!lit)color=0xFF181818; else if(segDb<-12f)color=0xFF00CC55; else if(segDb<-6f)color=0xFFFFBB00; else color=0xFFFF2200; mSegPaint.setColor(color); float y=h-1f-i*(segH+1f)-segH; mRect.set(1f,y,1f+segW,y+segH); g.drawRoundRect(mRect,2f,2f,mSegPaint); } if(mPeakDb>MIN_DB){ float frac=(mPeakDb-MIN_DB)/(-MIN_DB),py=h-1f-frac*(h-2f); long now=System.currentTimeMillis(); int pc; if(mPeakDb>=-3f)pc=0xFFFF2200; else if(mPeakDb>=-12f)pc=0xFFFFBB00; else pc=0xFF00FF88; boolean fading=now>mPeakHoldUntil-400; if(!fading||(now/150)%2==0){mPeakPaint.setColor(pc);g.drawLine(0,py,w,py,mPeakPaint);} } float[] dbMarks={0f,-6f,-12f,-24f,-48f,-60f}; String[] dbStrs={"0","-6","-12","-24","-48","-60"}; float lblAscent=-mDbLblPaint.ascent(); for(int di=0;di<dbMarks.length;di++){ float frac=(dbMarks[di]-MIN_DB)/(-MIN_DB),ly=h-1f-frac*(h-2f); if(dbMarks[di]>=-6f)mDbLblPaint.setColor(0xFFFF6644); else if(dbMarks[di]>=-12f)mDbLblPaint.setColor(0xFFFFDD44); else mDbLblPaint.setColor(0xCCBBFFCC); mDbLblPaint.setAlpha(200); g.drawText(dbStrs[di],w-1f,ly+lblAscent*0.5f,mDbLblPaint); } } }
-static class ZoomLeverView extends View { interface Listener{void onLever(float pos);} private Listener mListener; private volatile float mPos=0f; private boolean mTracking=false; private float trkT,trkB,trkH,trkW,mid,cx; private Paint mTrackPaint=new Paint(1),mThumbPaint=new Paint(1),mMarkPaint=new Paint(1),mTextPaint=new Paint(1); ZoomLeverView(Context c){ super(c); mTrackPaint.setColor(0x55FFFFFF); mThumbPaint.setColor(0xFFFFFFFF); mMarkPaint.setColor(0xAAFFFFFF); mMarkPaint.setStyle(Paint.Style.STROKE); mMarkPaint.setStrokeWidth(1.5f*c.getResources().getDisplayMetrics().density); mTextPaint.setColor(0xCCFFFFFF); mTextPaint.setTextAlign(Paint.Align.CENTER); mTextPaint.setTextSize(11*c.getResources().getDisplayMetrics().density); setBackgroundColor(0x44000000); } void setListener(Listener l){mListener=l;} private void recalc(){float w=getWidth(),h=getHeight(),lblH=mTextPaint.getTextSize()+dp(4); trkT=lblH; trkB=h-lblH; trkH=trkB-trkT; trkW=dp(16); mid=(trkT+trkB)/2f; cx=w/2f;} @Override protected void onDraw(Canvas g){ recalc(); float h=getHeight(); RectF track=new RectF(cx-trkW/2f,trkT,cx+trkW/2f,trkB); g.drawRoundRect(track,dp(5),dp(5),mTrackPaint); g.drawLine(cx-trkW/2f-dp(6),mid,cx+trkW/2f+dp(6),mid,mMarkPaint); float thumbCY=mid-mPos*trkH/2f,thumbH=dp(28),thumbW=trkW+dp(12); mThumbPaint.setAlpha((int)(160+90*Math.abs(mPos))); g.drawRoundRect(new RectF(cx-thumbW/2f,thumbCY-thumbH/2f,cx+thumbW/2f,thumbCY+thumbH/2f),dp(6),dp(6),mThumbPaint); Paint.FontMetrics fm=mTextPaint.getFontMetrics(); float pad=mTextPaint.getTextSize()+dp(2); g.drawText("T+",cx,pad/2f-(fm.ascent+fm.descent)/2f,mTextPaint); g.drawText("W−",cx,h-pad/2f-fm.ascent,mTextPaint); } @Override public boolean onTouchEvent(MotionEvent e){ recalc(); switch(e.getAction()){ case MotionEvent.ACTION_DOWN: case MotionEvent.ACTION_MOVE: removeCallbacks(mSpring); mTracking=true; mPos=Math.max(-1f,Math.min(1f,(mid-e.getY())/(trkH/2f))); if(mListener!=null)mListener.onLever(mPos); invalidate(); return true; case MotionEvent.ACTION_UP: case MotionEvent.ACTION_CANCEL: mTracking=false; post(mSpring); return true; } return super.onTouchEvent(e); } private Runnable mSpring=new Runnable(){ @Override public void run(){ if(mTracking)return; mPos*=0.75f; if(mListener!=null)mListener.onLever(mPos); invalidate(); if(Math.abs(mPos)>0.01f)postDelayed(this,16); else{mPos=0f;if(mListener!=null)mListener.onLever(0f);invalidate();} } }; private int dp(int x){return Math.round(x*getResources().getDisplayMetrics().density);} }
-class FocusAssistView extends View implements Runnable { private Bitmap mBmp; private Paint mBmpPaint=new Paint(Paint.ANTI_ALIAS_FLAG|Paint.FILTER_BITMAP_FLAG),mBorderPaint=new Paint(1),mGridPaint=new Paint(1),mLabelPaint=new Paint(1); private static final int ZOOM=4,SAMPLE_SIZE=120; private volatile boolean mRunning; FocusAssistView(Context c){ super(c); mBorderPaint.setColor(0xFFDDCC00); mBorderPaint.setStyle(Paint.Style.STROKE); mBorderPaint.setStrokeWidth(2f); mGridPaint.setColor(0x55FFFFFF); mGridPaint.setStyle(Paint.Style.STROKE); mGridPaint.setStrokeWidth(0.8f); mLabelPaint.setColor(0xFFDDCC00); mLabelPaint.setTextAlign(Paint.Align.CENTER); mLabelPaint.setTextSize(10*getResources().getDisplayMetrics().density); mLabelPaint.setAntiAlias(true); setBackgroundColor(0x00000000); } @Override protected void onAttachedToWindow(){super.onAttachedToWindow();mRunning=true;postDelayed(this,100);} @Override protected void onDetachedFromWindow(){super.onDetachedFromWindow();mRunning=false;removeCallbacks(this);} @Override public void run(){ if(!mRunning||getVisibility()!=View.VISIBLE){if(mRunning)postDelayed(this,200);return;} capture();postDelayed(this,100); } private void capture(){ if(mSv==null||!mSurfaceReady)return; if(Build.VERSION.SDK_INT<26){invalidate();return;} try{ int svW=mSv.getWidth(),svH=mSv.getHeight(); if(svW<=0||svH<=0)return; int cx=svW/2,cy=svH/2,half=SAMPLE_SIZE/2,l=Math.max(0,cx-half),t=Math.max(0,cy-half),r=Math.min(svW,l+SAMPLE_SIZE),b=Math.min(svH,t+SAMPLE_SIZE); android.graphics.Rect src=new android.graphics.Rect(l,t,r,b); Bitmap dst=Bitmap.createBitmap(r-l,b-t,Bitmap.Config.ARGB_8888); android.view.PixelCopy.request(mSv,src,dst,res->{if(res==android.view.PixelCopy.SUCCESS){mBmp=dst;postInvalidate();}},new Handler(Looper.getMainLooper())); }catch(Exception ignored){} } @Override protected void onDraw(Canvas g){ float w=getWidth(),h=getHeight(); g.drawARGB(200,0,0,0); if(mBmp!=null&&!mBmp.isRecycled())g.drawBitmap(mBmp,null,new RectF(0,0,w,h),mBmpPaint); else{Paint p=new Paint();p.setColor(0xFF333333);g.drawRect(0,0,w,h,p);} g.drawLine(w/2f,0,w/2f,h,mGridPaint); g.drawLine(0,h/2f,w,h/2f,mGridPaint); g.drawLine(w/3f,0,w/3f,h,mGridPaint); g.drawLine(2*w/3f,0,2*w/3f,h,mGridPaint); g.drawLine(0,h/3f,w,h/3f,mGridPaint); g.drawLine(0,2*h/3f,w,2*h/3f,mGridPaint); g.drawRect(1f,1f,w-1f,h-1f,mBorderPaint); float corner=w*0.12f; mBorderPaint.setStrokeWidth(3f); g.drawLine(1f,1f,corner,1f,mBorderPaint); g.drawLine(1f,1f,1f,corner,mBorderPaint); g.drawLine(w-corner,1f,w-1f,1f,mBorderPaint); g.drawLine(w-1f,1f,w-1f,corner,mBorderPaint); g.drawLine(1f,h-corner,1f,h-1f,mBorderPaint); g.drawLine(1f,h-1f,corner,h-1f,mBorderPaint); g.drawLine(w-1f,h-corner,w-1f,h-1f,mBorderPaint); g.drawLine(w-corner,h-1f,w-1f,h-1f,mBorderPaint); mBorderPaint.setStrokeWidth(2f); g.drawText("FOCUS ×"+ZOOM,w/2f,h-4f,mLabelPaint); } }
-static class FocusDrumView extends View { interface OnFocusChangeListener{void onFocusChanged(float value);} interface OnDrumScrollListener{void onScrollStart();void onScrollStop();} private OnFocusChangeListener mListener; private OnDrumScrollListener mScrollListener; private float mValue=0f,mLastY; private boolean mDragging; private float mAngle=0f; private static final float FULL_RANGE_PX_PER_UNIT=800f; private Paint mDrumPaint=new Paint(1),mRiskPaint=new Paint(1),mShadowPaint=new Paint(1),mCenterLinePaint=new Paint(1); FocusDrumView(Context c){ super(c); float d=c.getResources().getDisplayMetrics().density; mDrumPaint.setColor(0xFF2A2A2A); mRiskPaint.setStrokeWidth(1.5f*d); mRiskPaint.setStyle(Paint.Style.STROKE); mShadowPaint.setStyle(Paint.Style.FILL); mCenterLinePaint.setColor(0xFFDDCC00); mCenterLinePaint.setStrokeWidth(2f*d); mCenterLinePaint.setStyle(Paint.Style.STROKE); } void setOnFocusChangeListener(OnFocusChangeListener l){mListener=l;} void setOnDrumScrollListener(OnDrumScrollListener l){mScrollListener=l;} @Override protected void onDraw(Canvas g){ float w=getWidth(),h=getHeight(),cx=w/2f,drumW=w*0.72f,drumLeft=cx-drumW/2f,drumRight=cx+drumW/2f; RectF drumRect=new RectF(drumLeft,0,drumRight,h); mDrumPaint.setColor(0xFF222222); g.drawRoundRect(drumRect,drumW*0.12f,drumW*0.12f,mDrumPaint); float riskStep=h*0.07f,offset=mAngle%riskStep; if(offset<0)offset+=riskStep; int totalRisks=(int)(h/riskStep)+2; for(int i=-1;i<=totalRisks;i++){ float ry=offset+i*riskStep; if(ry<0||ry>h)continue; float distFromCenter=Math.abs(ry-h/2f)/(h/2f); float squeeze=1f-0.55f*distFromCenter*distFromCenter; float riskLen=drumW*0.8f*squeeze; int alpha=(int)(200*(1f-distFromCenter*0.7f)); boolean isMajor=(Math.abs(Math.round((ry-offset)/riskStep))%5==0); if(isMajor){riskLen*=1.25f;alpha=Math.min(255,alpha+40);} mRiskPaint.setColor(0xFFFFFFFF); mRiskPaint.setAlpha(alpha); mRiskPaint.setStrokeWidth(isMajor?2f:1.2f); g.drawLine(cx-riskLen/2f,ry,cx+riskLen/2f,ry,mRiskPaint); } int[] ct={0xCC000000,0x00000000},cb={0x00000000,0xCC000000}; android.graphics.LinearGradient shT=new android.graphics.LinearGradient(0,0,0,h*0.28f,ct,null,android.graphics.Shader.TileMode.CLAMP); android.graphics.LinearGradient shB=new android.graphics.LinearGradient(0,h*0.72f,0,h,cb,null,android.graphics.Shader.TileMode.CLAMP); mShadowPaint.setShader(shT); g.drawRoundRect(drumRect,drumW*0.12f,drumW*0.12f,mShadowPaint); mShadowPaint.setShader(shB); g.drawRoundRect(drumRect,drumW*0.12f,drumW*0.12f,mShadowPaint); mShadowPaint.setShader(null); g.drawLine(drumLeft-4f,h/2f,drumRight+4f,h/2f,mCenterLinePaint); } @Override public boolean onTouchEvent(MotionEvent e){ switch(e.getAction()){ case MotionEvent.ACTION_DOWN: mLastY=e.getY();mDragging=true;if(mScrollListener!=null)mScrollListener.onScrollStart();return true; case MotionEvent.ACTION_MOVE:{ if(!mDragging)return true; float dy=e.getY()-mLastY;mLastY=e.getY();mAngle+=dy; float newVal=mValue-dy/FULL_RANGE_PX_PER_UNIT; newVal=Math.max(0f,Math.min(1f,newVal)); if(newVal==0f&&mValue==0f)mAngle=Math.min(mAngle,0f); if(newVal==1f&&mValue==1f)mAngle=Math.max(mAngle,0f); if(newVal!=mValue){mValue=newVal;if(mListener!=null)mListener.onFocusChanged(mValue);} invalidate();return true; } case MotionEvent.ACTION_UP: case MotionEvent.ACTION_CANCEL: mDragging=false;if(mScrollListener!=null)mScrollListener.onScrollStop();return true; } return false; } }
-static class OscilloscopeView extends View { private static final int DISP_SAMPLES=2048,BUF_SIZE=DISP_SAMPLES*4; private float[] mRingBuf=new float[BUF_SIZE]; private int mWritePos=0; private float[] mFrame=new float[DISP_SAMPLES]; private volatile boolean mNewFrame=false; private Object mLock=new Object(); private static final float TRIG_LEVEL=0.05f; private static final int TRIG_HYSTERESIS=64; private Paint mWavePaint=new Paint(1),mGridPaint=new Paint(1),mLabelPaint=new Paint(1); static int levelColor(float a){if(a>=0.7f)return 0xFFFF2200;if(a>=0.3f)return 0xFFFFBB00;return 0xFF00CC55;} OscilloscopeView(Context c){ super(c); setBackgroundColor(0x00000000); mWavePaint.setStrokeWidth(1.8f*c.getResources().getDisplayMetrics().density); mWavePaint.setStyle(Paint.Style.STROKE); mWavePaint.setStrokeCap(Paint.Cap.ROUND); mGridPaint.setColor(0x33FFFFFF); mGridPaint.setStrokeWidth(0.8f); mGridPaint.setStyle(Paint.Style.STROKE); mLabelPaint.setColor(0xAAFFFFFF); mLabelPaint.setTextSize(9*c.getResources().getDisplayMetrics().density); mLabelPaint.setAntiAlias(true); } void pushSamples(short[] b,int len,int ch){ synchronized(mLock){ for(int i=0;i<len;i+=ch){float mono=b[i]/32768f;if(ch==2&&i+1<len)mono=(mono+b[i+1]/32768f)*0.5f;mRingBuf[mWritePos]=mono;mWritePos=(mWritePos+1)%BUF_SIZE;} int trigPos=-1,searchStart=(mWritePos-BUF_SIZE+BUF_SIZE)%BUF_SIZE; for(int k=TRIG_HYSTERESIS;k<BUF_SIZE-DISP_SAMPLES;k++){int p=(searchStart+k)%BUF_SIZE;if(mRingBuf[(p-1+BUF_SIZE)%BUF_SIZE]<TRIG_LEVEL&&mRingBuf[p]>=TRIG_LEVEL){trigPos=p;break;}} if(trigPos<0)trigPos=(mWritePos-DISP_SAMPLES+BUF_SIZE)%BUF_SIZE; for(int k=0;k<DISP_SAMPLES;k++)mFrame[k]=mRingBuf[(trigPos+k)%BUF_SIZE]; mNewFrame=true; } postInvalidate(); } @Override protected void onDraw(Canvas g){ float w=getWidth(),h=getHeight();if(w==0||h==0)return; for(int i=1;i<4;i++)g.drawLine(w*i/4f,0,w*i/4f,h,mGridPaint); for(int i=1;i<4;i++)g.drawLine(0,h*i/4f,w,h*i/4f,mGridPaint); Paint zp=new Paint(mGridPaint);zp.setColor(0x55FFFFFF);zp.setStrokeWidth(1.4f);g.drawLine(0,h/2f,w,h/2f,zp); Paint tp=new Paint();tp.setColor(0x88FFFF00);tp.setStrokeWidth(1f);tp.setStyle(Paint.Style.STROKE);tp.setPathEffect(new DashPathEffect(new float[]{6f,4f},0));g.drawLine(0,h/2f-TRIG_LEVEL*h/2f,w,h/2f-TRIG_LEVEL*h/2f,tp); float[] frame; synchronized(mLock){frame=mFrame.clone();} for(int i=0;i<DISP_SAMPLES-1;i++){float x0=i*w/(DISP_SAMPLES-1f),x1=(i+1)*w/(DISP_SAMPLES-1f),y0=h/2f-frame[i]*h/2f*0.92f,y1=h/2f-frame[i+1]*h/2f*0.92f;g.drawLine(x0,y0,x1,y1,mWavePaint);} g.drawText("OSC  T↑",4,h-3f,mLabelPaint); } }
-static class EnvelopeView extends View { private static final int HIST=1000,CHUNK=441; private float[] mEnv=new float[HIST]; private int mWritePos=0,mFilled=0; private float mAccPeak=0f; private int mAccCount=0; private Object mLock=new Object(); private Paint mSegPaint=new Paint(1),mGridPaint=new Paint(1),mLabelPaint=new Paint(1); EnvelopeView(Context c){ super(c); setBackgroundColor(0x00000000); float d=c.getResources().getDisplayMetrics().density; mSegPaint.setStyle(Paint.Style.STROKE); mSegPaint.setStrokeWidth(1.6f*d); mSegPaint.setStrokeCap(Paint.Cap.ROUND); mGridPaint.setColor(0x33FFFFFF); mGridPaint.setStrokeWidth(0.8f); mGridPaint.setStyle(Paint.Style.STROKE); mLabelPaint.setColor(0xAAFFFFFF); mLabelPaint.setTextSize(9*d); mLabelPaint.setAntiAlias(true); } void pushSamples(short[] b,int len,int ch){ synchronized(mLock){ for(int i=0;i<len;i+=ch){float s=Math.abs(b[i]/32768f);if(ch==2&&i+1<len)s=Math.max(s,Math.abs(b[i+1]/32768f));if(s>mAccPeak)mAccPeak=s;mAccCount++;if(mAccCount>=CHUNK){mEnv[mWritePos]=mAccPeak;mWritePos=(mWritePos+1)%HIST;if(mFilled<HIST)mFilled++;mAccPeak=0f;mAccCount=0;}} } postInvalidate(); } @Override protected void onDraw(Canvas g){ float w=getWidth(),h=getHeight();if(w==0||h==0)return; for(int i=1;i<4;i++)g.drawLine(w*i/4f,0,w*i/4f,h,mGridPaint); for(int i=1;i<4;i++)g.drawLine(0,h*i/4f,w,h*i/4f,mGridPaint); Paint zp=new Paint(mGridPaint);zp.setColor(0x55FFFFFF);zp.setStrokeWidth(1.4f);g.drawLine(0,h/2f,w,h/2f,zp); float[] snap; int filled,wp; synchronized(mLock){snap=mEnv.clone();filled=mFilled;wp=mWritePos;} if(filled<2){mLabelPaint.setColor(0xAAFFFFFF);g.drawText("ENV  10s",4,h-3f,mLabelPaint);return;} int count=Math.min(filled,HIST),start=(filled<HIST)?0:wp; for(int i=0;i<count-1;i++){ float a0=snap[(start+i)%HIST],a1=snap[(start+i+1)%HIST]; float x0=i*w/(count-1f),x1=(i+1)*w/(count-1f); float yT0=h/2f-a0*h/2f*0.92f,yT1=h/2f-a1*h/2f*0.92f,yB0=h/2f+a0*h/2f*0.92f,yB1=h/2f+a1*h/2f*0.92f; mSegPaint.setColor(OscilloscopeView.levelColor((a0+a1)*0.5f)); g.drawLine(x0,yT0,x1,yT1,mSegPaint); g.drawLine(x0,yB0,x1,yB1,mSegPaint); } Paint cp=new Paint();cp.setColor(0x66FFFFFF);cp.setStrokeWidth(1f);g.drawLine(w-1f,0,w-1f,h,cp); mLabelPaint.setColor(0xAAFFFFFF);g.drawText("ENV  10s",4,h-3f,mLabelPaint); } }
-static class SpectrumView extends View { private static final int FFT_SIZE=2048,HALF=FFT_SIZE/2; private float[] mAccBuf=new float[FFT_SIZE]; private int mAccPos=0; private float[] mMagnitude=new float[HALF],mSmooth=new float[HALF],mPeaks=new float[HALF]; private Object mLock=new Object(); private float[] mFftRe=new float[FFT_SIZE],mFftIm=new float[FFT_SIZE],mWindow=new float[FFT_SIZE]; private Paint mBarPaint=new Paint(1),mPeakPaint=new Paint(1),mLblPaint=new Paint(1),mBgPaint=new Paint(); private static final int DISPLAY_BINS=60; private static final float SAMPLE_RATE=44100f,DECAY=0.82f,PEAK_DECAY=0.996f; SpectrumView(Context c){ super(c); for(int i=0;i<FFT_SIZE;i++)mWindow[i]=0.5f*(1f-(float)Math.cos(2.0*Math.PI*i/(FFT_SIZE-1))); mBarPaint.setStyle(Paint.Style.FILL); mPeakPaint.setStyle(Paint.Style.STROKE); mPeakPaint.setColor(0xFFFFFFFF); mPeakPaint.setStrokeWidth(1.5f); mLblPaint.setColor(0xCCFFFFFF); mLblPaint.setTextSize(7.5f*c.getResources().getDisplayMetrics().density); mLblPaint.setAntiAlias(true); mBgPaint.setColor(0x00000000); } void pushSamples(short[] b,int len,int ch){ for(int i=0;i<len;i+=ch){float mono=b[i]/32768f;if(ch==2&&i+1<len)mono=(mono+b[i+1]/32768f)*0.5f;mAccBuf[mAccPos++]=mono;if(mAccPos>=FFT_SIZE){computeFFT();System.arraycopy(mAccBuf,FFT_SIZE/2,mAccBuf,0,FFT_SIZE/2);mAccPos=FFT_SIZE/2;}} } private void computeFFT(){ for(int i=0;i<FFT_SIZE;i++){mFftRe[i]=mAccBuf[i]*mWindow[i];mFftIm[i]=0f;} int n=FFT_SIZE; for(int i=1,j=0;i<n;i++){int bit=n>>1;for(;(j&bit)!=0;bit>>=1)j^=bit;j^=bit;if(i<j){float tr=mFftRe[i];mFftRe[i]=mFftRe[j];mFftRe[j]=tr;float ti=mFftIm[i];mFftIm[i]=mFftIm[j];mFftIm[j]=ti;}} for(int len=2;len<=n;len<<=1){double ang=-2.0*Math.PI/len;float wRe=(float)Math.cos(ang),wIm=(float)Math.sin(ang); for(int i=0;i<n;i+=len){float curRe=1f,curIm=0f; for(int k=0;k<len/2;k++){float uRe=mFftRe[i+k],uIm=mFftIm[i+k]; float vRe=mFftRe[i+k+len/2]*curRe-mFftIm[i+k+len/2]*curIm; float vIm=mFftRe[i+k+len/2]*curIm+mFftIm[i+k+len/2]*curRe; mFftRe[i+k]=uRe+vRe;mFftIm[i+k]=uIm+vIm; mFftRe[i+k+len/2]=uRe-vRe;mFftIm[i+k+len/2]=uIm-vIm; float nRe=curRe*wRe-curIm*wIm;curIm=curRe*wIm+curIm*wRe;curRe=nRe;}}} synchronized(mLock){ for(int i=0;i<HALF;i++){float mag=(float)Math.sqrt(mFftRe[i]*mFftRe[i]+mFftIm[i]*mFftIm[i])/(FFT_SIZE/2f); float db=mag>1e-9f?Math.max(-90f,(float)(20.0*Math.log10(mag))):-90f; float norm=(db+90f)/90f; mMagnitude[i]=norm;mSmooth[i]=Math.max(norm,mSmooth[i]*DECAY);mPeaks[i]=Math.max(mSmooth[i],mPeaks[i]*PEAK_DECAY);} } postInvalidate(); } @Override protected void onDraw(Canvas g){ float w=getWidth(),h=getHeight();if(w==0||h==0)return; float lblH=mLblPaint.getTextSize()+4f,barTop=lblH,barAreaH=h-barTop; float[] freqMarks={50,100,200,500,1000,2000,5000,10000,20000}; String[] freqLabels={"50","100","200","500","1k","2k","5k","10k","20k"}; float fMin=(float)Math.log10(20.0),fMax=(float)Math.log10(SAMPLE_RATE/2f); Paint gp=new Paint();gp.setColor(0x44FFFFFF);gp.setStrokeWidth(0.8f); for(int i=0;i<freqMarks.length;i++){if(freqMarks[i]>SAMPLE_RATE/2f)break; float xf=((float)Math.log10(freqMarks[i])-fMin)/(fMax-fMin)*w; g.drawLine(xf,barTop,xf,h,gp);} float[] smooth,peaks; synchronized(mLock){smooth=mSmooth.clone();peaks=mPeaks.clone();} float logFMin=(float)Math.log10(Math.max(1f,20f)),logFMaxV=(float)Math.log10(SAMPLE_RATE/2f); for(int b=0;b<DISPLAY_BINS;b++){ float logF0=logFMin+(float)b/DISPLAY_BINS*(logFMaxV-logFMin),logF1=logFMin+(float)(b+1)/DISPLAY_BINS*(logFMaxV-logFMin); float f0=(float)Math.pow(10.0,logF0),f1=(float)Math.pow(10.0,logF1); int bin0=Math.max(0,Math.round(f0/SAMPLE_RATE*FFT_SIZE)),bin1=Math.min(HALF-1,Math.round(f1/SAMPLE_RATE*FFT_SIZE)); float val=0f,pk=0f; for(int i=bin0;i<=bin1;i++){if(smooth[i]>val)val=smooth[i];if(peaks[i]>pk)pk=peaks[i];} float x0=(float)b/DISPLAY_BINS*w,x1=(float)(b+1)/DISPLAY_BINS*w-1f;if(x1<x0+0.5f)x1=x0+0.5f; int red=Math.min(255,(int)(val*510f)),green=Math.min(255,(int)((1f-val)*510f)); mBarPaint.setColor(0xDD000000|(red<<16)|(green<<8)|0x22); float barH=val*barAreaH; g.drawRect(x0,h-barH,x1,h,mBarPaint); if(pk>0.02f){float peakY=h-pk*barAreaH;g.drawLine(x0,peakY,x1,peakY,mPeakPaint);} } float labelY=lblH-4f,prevLblRight=-1f; mLblPaint.setTextAlign(Paint.Align.CENTER); for(int i=0;i<freqMarks.length;i++){if(freqMarks[i]>SAMPLE_RATE/2f)break; float xf=((float)Math.log10(freqMarks[i])-fMin)/(fMax-fMin)*w; float lblW=mLblPaint.measureText(freqLabels[i]),lblX=xf-lblW/2f; if(lblX>prevLblRight&&lblX+lblW<w-2f){g.drawText(freqLabels[i],xf,labelY,mLblPaint);prevLblRight=lblX+lblW+3f;} } } }
+    // -------- CUSTOM VIEWS (identical to your original file, fully included) --------
+    static class VerticalSeekBar extends View { private int mMax=100,mProgress=0; private final Paint mTrackPaint=new Paint(Paint.ANTI_ALIAS_FLAG),mFillPaint=new Paint(Paint.ANTI_ALIAS_FLAG),mThumbPaint=new Paint(Paint.ANTI_ALIAS_FLAG),mRidgePaint=new Paint(Paint.ANTI_ALIAS_FLAG); private SeekBar.OnSeekBarChangeListener mListener; VerticalSeekBar(Context c){ super(c); mTrackPaint.setColor(0x44FFFFFF); mFillPaint.setColor(0xFFDDCC00); mThumbPaint.setColor(0xFFEEEEEE); mRidgePaint.setColor(0xFF888866); mRidgePaint.setStyle(Paint.Style.STROKE); mRidgePaint.setStrokeWidth(1.2f*c.getResources().getDisplayMetrics().density); setClickable(true); } void setMax(int m){mMax=m;invalidate();} void setProgress(int p){mProgress=Math.max(0,Math.min(mMax,p));invalidate();} int getMax(){return mMax;} int getProgress(){return mProgress;} void setOnSeekBarChangeListener(SeekBar.OnSeekBarChangeListener l){mListener=l;} private float faderH(float w){return Math.round(w*0.7f)+dp(20);} private int dp(int x){return Math.round(x*getResources().getDisplayMetrics().density);} @Override protected void onDraw(Canvas g){ float w=getWidth(),h=getHeight(),trackW=w*0.3f,cx=w/2f,trkX1=cx-trackW/2f,trkX2=cx+trackW/2f,halfFader=faderH(w)/2f,padV=halfFader+2f,trkT=padV,trkB=h-padV,trkH=trkB-trkT; float frac=mMax>0?(float)mProgress/mMax:0f,thumbY=trkB-frac*trkH; g.drawRoundRect(new RectF(trkX1,trkT,trkX2,trkB),trackW/2f,trackW/2f,mTrackPaint); g.drawRoundRect(new RectF(trkX1,thumbY,trkX2,trkB),trackW/2f,trackW/2f,mFillPaint); Paint z=new Paint(Paint.ANTI_ALIAS_FLAG);z.setColor(0x88FFFFFF);z.setStrokeWidth(1.5f); g.drawLine(trkX1-3f,trkB-0.5f*trkH,trkX2+3f,trkB-0.5f*trkH,z); float fH=faderH(w),fW=w-2f; RectF fader=new RectF(1f,thumbY-fH/2f,1f+fW,thumbY+fH/2f); Paint sh=new Paint(Paint.ANTI_ALIAS_FLAG);sh.setColor(0x66000000);sh.setStyle(Paint.Style.FILL); g.drawRoundRect(new RectF(fader.left+2,fader.top+3,fader.right+2,fader.bottom+3),dp(4),dp(4),sh); g.drawRoundRect(fader,dp(4),dp(4),mThumbPaint); float rInset=fW*0.18f; for(int ri=-1;ri<=1;ri++){float ry=thumbY+ri*dp(4);g.drawLine(1f+rInset,ry,1f+fW-rInset,ry,mRidgePaint);} Paint cL=new Paint(Paint.ANTI_ALIAS_FLAG);cL.setColor(0xFFDDCC00);cL.setStrokeWidth(1.5f); g.drawLine(1f+rInset*0.6f,thumbY,1f+fW-rInset*0.6f,thumbY,cL); } @Override public boolean onTouchEvent(MotionEvent e){ if(!isEnabled())return false; float h=getHeight(),w=getWidth(),halfFader=faderH(w)/2f,padV=halfFader+2f,trkT=padV,trkB=h-padV,trkH=trkB-trkT; switch(e.getAction()){ case MotionEvent.ACTION_DOWN:if(mListener!=null)mListener.onStartTrackingTouch(null); case MotionEvent.ACTION_MOVE:{float frac=1f-(e.getY()-trkT)/trkH;int p=Math.max(0,Math.min(mMax,Math.round(frac*mMax)));mProgress=p;invalidate();if(mListener!=null)mListener.onProgressChanged(null,p,true);return true;} case MotionEvent.ACTION_UP: case MotionEvent.ACTION_CANCEL:if(mListener!=null)mListener.onStopTrackingTouch(null);return true; } return false; } }
+    static class VuMeterView extends View { private static final int N=30; private static final float MIN_DB=-60f; private static final long PEAK_HOLD_MS=1800; private Paint mSegPaint=new Paint(1),mPeakPaint=new Paint(1),mDbLblPaint=new Paint(1); private RectF mRect=new RectF(); private float mLevelDb=MIN_DB,mPeakDb=MIN_DB; private long mPeakHoldUntil=0; VuMeterView(Context c){ super(c); mPeakPaint.setColor(-1); mPeakPaint.setStrokeWidth(4f*c.getResources().getDisplayMetrics().density); mPeakPaint.setStyle(Paint.Style.STROKE); mDbLblPaint.setTextSize(5.5f*c.getResources().getDisplayMetrics().density); mDbLblPaint.setTextAlign(Paint.Align.RIGHT); mDbLblPaint.setAntiAlias(true); } void setLevel(float rms){mLevelDb=rms>1e-6f?Math.max(MIN_DB,(float)(20.0*Math.log10(rms))):MIN_DB;postInvalidate();} void setPeak(float peak){float db=peak>1e-6f?Math.max(MIN_DB,(float)(20.0*Math.log10(peak))):MIN_DB;if(db>=mPeakDb||System.currentTimeMillis()>mPeakHoldUntil){mPeakDb=db;mPeakHoldUntil=System.currentTimeMillis()+PEAK_HOLD_MS;}} @Override protected void onDraw(Canvas g){ float w=getWidth(),h=getHeight(),segH=(h-N-1f)/N,segW=w-2f; for(int i=0;i<N;i++){ float segDb=MIN_DB+(float)i/N*(-MIN_DB); boolean lit=mLevelDb>=segDb; int color; if(!lit)color=0xFF181818; else if(segDb<-12f)color=0xFF00CC55; else if(segDb<-6f)color=0xFFFFBB00; else color=0xFFFF2200; mSegPaint.setColor(color); float y=h-1f-i*(segH+1f)-segH; mRect.set(1f,y,1f+segW,y+segH); g.drawRoundRect(mRect,2f,2f,mSegPaint); } if(mPeakDb>MIN_DB){ float frac=(mPeakDb-MIN_DB)/(-MIN_DB),py=h-1f-frac*(h-2f); long now=System.currentTimeMillis(); int pc; if(mPeakDb>=-3f)pc=0xFFFF2200; else if(mPeakDb>=-12f)pc=0xFFFFBB00; else pc=0xFF00FF88; boolean fading=now>mPeakHoldUntil-400; if(!fading||(now/150)%2==0){mPeakPaint.setColor(pc);g.drawLine(0,py,w,py,mPeakPaint);} } float[] dbMarks={0f,-6f,-12f,-24f,-48f,-60f}; String[] dbStrs={"0","-6","-12","-24","-48","-60"}; float lblAscent=-mDbLblPaint.ascent(); for(int di=0;di<dbMarks.length;di++){ float frac=(dbMarks[di]-MIN_DB)/(-MIN_DB),ly=h-1f-frac*(h-2f); if(dbMarks[di]>=-6f)mDbLblPaint.setColor(0xFFFF6644); else if(dbMarks[di]>=-12f)mDbLblPaint.setColor(0xFFFFDD44); else mDbLblPaint.setColor(0xCCBBFFCC); mDbLblPaint.setAlpha(200); g.drawText(dbStrs[di],w-1f,ly+lblAscent*0.5f,mDbLblPaint); } } }
+    static class ZoomLeverView extends View { interface Listener{void onLever(float pos);} private Listener mListener; private volatile float mPos=0f; private boolean mTracking=false; private float trkT,trkB,trkH,trkW,mid,cx; private Paint mTrackPaint=new Paint(1),mThumbPaint=new Paint(1),mMarkPaint=new Paint(1),mTextPaint=new Paint(1); ZoomLeverView(Context c){ super(c); mTrackPaint.setColor(0x55FFFFFF); mThumbPaint.setColor(0xFFFFFFFF); mMarkPaint.setColor(0xAAFFFFFF); mMarkPaint.setStyle(Paint.Style.STROKE); mMarkPaint.setStrokeWidth(1.5f*c.getResources().getDisplayMetrics().density); mTextPaint.setColor(0xCCFFFFFF); mTextPaint.setTextAlign(Paint.Align.CENTER); mTextPaint.setTextSize(11*c.getResources().getDisplayMetrics().density); setBackgroundColor(0x44000000); } void setListener(Listener l){mListener=l;} private void recalc(){float w=getWidth(),h=getHeight(),lblH=mTextPaint.getTextSize()+dp(4); trkT=lblH; trkB=h-lblH; trkH=trkB-trkT; trkW=dp(16); mid=(trkT+trkB)/2f; cx=w/2f;} @Override protected void onDraw(Canvas g){ recalc(); float h=getHeight(); RectF track=new RectF(cx-trkW/2f,trkT,cx+trkW/2f,trkB); g.drawRoundRect(track,dp(5),dp(5),mTrackPaint); g.drawLine(cx-trkW/2f-dp(6),mid,cx+trkW/2f+dp(6),mid,mMarkPaint); float thumbCY=mid-mPos*trkH/2f,thumbH=dp(28),thumbW=trkW+dp(12); mThumbPaint.setAlpha((int)(160+90*Math.abs(mPos))); g.drawRoundRect(new RectF(cx-thumbW/2f,thumbCY-thumbH/2f,cx+thumbW/2f,thumbCY+thumbH/2f),dp(6),dp(6),mThumbPaint); Paint.FontMetrics fm=mTextPaint.getFontMetrics(); float pad=mTextPaint.getTextSize()+dp(2); g.drawText("T+",cx,pad/2f-(fm.ascent+fm.descent)/2f,mTextPaint); g.drawText("W−",cx,h-pad/2f-fm.ascent,mTextPaint); } @Override public boolean onTouchEvent(MotionEvent e){ recalc(); switch(e.getAction()){ case MotionEvent.ACTION_DOWN: case MotionEvent.ACTION_MOVE: removeCallbacks(mSpring); mTracking=true; mPos=Math.max(-1f,Math.min(1f,(mid-e.getY())/(trkH/2f))); if(mListener!=null)mListener.onLever(mPos); invalidate(); return true; case MotionEvent.ACTION_UP: case MotionEvent.ACTION_CANCEL: mTracking=false; post(mSpring); return true; } return super.onTouchEvent(e); } private Runnable mSpring=new Runnable(){ @Override public void run(){ if(mTracking)return; mPos*=0.75f; if(mListener!=null)mListener.onLever(mPos); invalidate(); if(Math.abs(mPos)>0.01f)postDelayed(this,16); else{mPos=0f;if(mListener!=null)mListener.onLever(0f);invalidate();} } }; private int dp(int x){return Math.round(x*getResources().getDisplayMetrics().density);} }
+    class FocusAssistView extends View implements Runnable { private Bitmap mBmp; private Paint mBmpPaint=new Paint(Paint.ANTI_ALIAS_FLAG|Paint.FILTER_BITMAP_FLAG),mBorderPaint=new Paint(1),mGridPaint=new Paint(1),mLabelPaint=new Paint(1); private static final int ZOOM=4,SAMPLE_SIZE=120; private volatile boolean mRunning; FocusAssistView(Context c){ super(c); mBorderPaint.setColor(0xFFDDCC00); mBorderPaint.setStyle(Paint.Style.STROKE); mBorderPaint.setStrokeWidth(2f); mGridPaint.setColor(0x55FFFFFF); mGridPaint.setStyle(Paint.Style.STROKE); mGridPaint.setStrokeWidth(0.8f); mLabelPaint.setColor(0xFFDDCC00); mLabelPaint.setTextAlign(Paint.Align.CENTER); mLabelPaint.setTextSize(10*getResources().getDisplayMetrics().density); mLabelPaint.setAntiAlias(true); setBackgroundColor(0x00000000); } @Override protected void onAttachedToWindow(){super.onAttachedToWindow();mRunning=true;postDelayed(this,100);} @Override protected void onDetachedFromWindow(){super.onDetachedFromWindow();mRunning=false;removeCallbacks(this);} @Override public void run(){ if(!mRunning||getVisibility()!=View.VISIBLE){if(mRunning)postDelayed(this,200);return;} capture();postDelayed(this,100); } private void capture(){ if(mSv==null||!mSurfaceReady)return; if(Build.VERSION.SDK_INT<26){invalidate();return;} try{ int svW=mSv.getWidth(),svH=mSv.getHeight(); if(svW<=0||svH<=0)return; int cx=svW/2,cy=svH/2,half=SAMPLE_SIZE/2,l=Math.max(0,cx-half),t=Math.max(0,cy-half),r=Math.min(svW,l+SAMPLE_SIZE),b=Math.min(svH,t+SAMPLE_SIZE); android.graphics.Rect src=new android.graphics.Rect(l,t,r,b); Bitmap dst=Bitmap.createBitmap(r-l,b-t,Bitmap.Config.ARGB_8888); android.view.PixelCopy.request(mSv,src,dst,res->{if(res==android.view.PixelCopy.SUCCESS){mBmp=dst;postInvalidate();}},new Handler(Looper.getMainLooper())); }catch(Exception ignored){} } @Override protected void onDraw(Canvas g){ float w=getWidth(),h=getHeight(); g.drawARGB(200,0,0,0); if(mBmp!=null&&!mBmp.isRecycled())g.drawBitmap(mBmp,null,new RectF(0,0,w,h),mBmpPaint); else{Paint p=new Paint();p.setColor(0xFF333333);g.drawRect(0,0,w,h,p);} g.drawLine(w/2f,0,w/2f,h,mGridPaint); g.drawLine(0,h/2f,w,h/2f,mGridPaint); g.drawLine(w/3f,0,w/3f,h,mGridPaint); g.drawLine(2*w/3f,0,2*w/3f,h,mGridPaint); g.drawLine(0,h/3f,w,h/3f,mGridPaint); g.drawLine(0,2*h/3f,w,2*h/3f,mGridPaint); g.drawRect(1f,1f,w-1f,h-1f,mBorderPaint); float corner=w*0.12f; mBorderPaint.setStrokeWidth(3f); g.drawLine(1f,1f,corner,1f,mBorderPaint); g.drawLine(1f,1f,1f,corner,mBorderPaint); g.drawLine(w-corner,1f,w-1f,1f,mBorderPaint); g.drawLine(w-1f,1f,w-1f,corner,mBorderPaint); g.drawLine(1f,h-corner,1f,h-1f,mBorderPaint); g.drawLine(1f,h-1f,corner,h-1f,mBorderPaint); g.drawLine(w-1f,h-corner,w-1f,h-1f,mBorderPaint); g.drawLine(w-corner,h-1f,w-1f,h-1f,mBorderPaint); mBorderPaint.setStrokeWidth(2f); g.drawText("FOCUS ×"+ZOOM,w/2f,h-4f,mLabelPaint); } }
+    static class FocusDrumView extends View { interface OnFocusChangeListener{void onFocusChanged(float value);} interface OnDrumScrollListener{void onScrollStart();void onScrollStop();} private OnFocusChangeListener mListener; private OnDrumScrollListener mScrollListener; private float mValue=0f,mLastY; private boolean mDragging; private float mAngle=0f; private static final float FULL_RANGE_PX_PER_UNIT=800f; private Paint mDrumPaint=new Paint(1),mRiskPaint=new Paint(1),mShadowPaint=new Paint(1),mCenterLinePaint=new Paint(1); FocusDrumView(Context c){ super(c); float d=c.getResources().getDisplayMetrics().density; mDrumPaint.setColor(0xFF2A2A2A); mRiskPaint.setStrokeWidth(1.5f*d); mRiskPaint.setStyle(Paint.Style.STROKE); mShadowPaint.setStyle(Paint.Style.FILL); mCenterLinePaint.setColor(0xFFDDCC00); mCenterLinePaint.setStrokeWidth(2f*d); mCenterLinePaint.setStyle(Paint.Style.STROKE); } void setOnFocusChangeListener(OnFocusChangeListener l){mListener=l;} void setOnDrumScrollListener(OnDrumScrollListener l){mScrollListener=l;} @Override protected void onDraw(Canvas g){ float w=getWidth(),h=getHeight(),cx=w/2f,drumW=w*0.72f,drumLeft=cx-drumW/2f,drumRight=cx+drumW/2f; RectF drumRect=new RectF(drumLeft,0,drumRight,h); mDrumPaint.setColor(0xFF222222); g.drawRoundRect(drumRect,drumW*0.12f,drumW*0.12f,mDrumPaint); float riskStep=h*0.07f,offset=mAngle%riskStep; if(offset<0)offset+=riskStep; int totalRisks=(int)(h/riskStep)+2; for(int i=-1;i<=totalRisks;i++){ float ry=offset+i*riskStep; if(ry<0||ry>h)continue; float distFromCenter=Math.abs(ry-h/2f)/(h/2f); float squeeze=1f-0.55f*distFromCenter*distFromCenter; float riskLen=drumW*0.8f*squeeze; int alpha=(int)(200*(1f-distFromCenter*0.7f)); boolean isMajor=(Math.abs(Math.round((ry-offset)/riskStep))%5==0); if(isMajor){riskLen*=1.25f;alpha=Math.min(255,alpha+40);} mRiskPaint.setColor(0xFFFFFFFF); mRiskPaint.setAlpha(alpha); mRiskPaint.setStrokeWidth(isMajor?2f:1.2f); g.drawLine(cx-riskLen/2f,ry,cx+riskLen/2f,ry,mRiskPaint); } int[] ct={0xCC000000,0x00000000},cb={0x00000000,0xCC000000}; android.graphics.LinearGradient shT=new android.graphics.LinearGradient(0,0,0,h*0.28f,ct,null,android.graphics.Shader.TileMode.CLAMP); android.graphics.LinearGradient shB=new android.graphics.LinearGradient(0,h*0.72f,0,h,cb,null,android.graphics.Shader.TileMode.CLAMP); mShadowPaint.setShader(shT); g.drawRoundRect(drumRect,drumW*0.12f,drumW*0.12f,mShadowPaint); mShadowPaint.setShader(shB); g.drawRoundRect(drumRect,drumW*0.12f,drumW*0.12f,mShadowPaint); mShadowPaint.setShader(null); g.drawLine(drumLeft-4f,h/2f,drumRight+4f,h/2f,mCenterLinePaint); } @Override public boolean onTouchEvent(MotionEvent e){ switch(e.getAction()){ case MotionEvent.ACTION_DOWN: mLastY=e.getY();mDragging=true;if(mScrollListener!=null)mScrollListener.onScrollStart();return true; case MotionEvent.ACTION_MOVE:{ if(!mDragging)return true; float dy=e.getY()-mLastY;mLastY=e.getY();mAngle+=dy; float newVal=mValue-dy/FULL_RANGE_PX_PER_UNIT; newVal=Math.max(0f,Math.min(1f,newVal)); if(newVal==0f&&mValue==0f)mAngle=Math.min(mAngle,0f); if(newVal==1f&&mValue==1f)mAngle=Math.max(mAngle,0f); if(newVal!=mValue){mValue=newVal;if(mListener!=null)mListener.onFocusChanged(mValue);} invalidate();return true; } case MotionEvent.ACTION_UP: case MotionEvent.ACTION_CANCEL: mDragging=false;if(mScrollListener!=null)mScrollListener.onScrollStop();return true; } return false; } }
+    static class OscilloscopeView extends View { private static final int DISP_SAMPLES=2048,BUF_SIZE=DISP_SAMPLES*4; private float[] mRingBuf=new float[BUF_SIZE]; private int mWritePos=0; private float[] mFrame=new float[DISP_SAMPLES]; private volatile boolean mNewFrame=false; private Object mLock=new Object(); private static final float TRIG_LEVEL=0.05f; private static final int TRIG_HYSTERESIS=64; private Paint mWavePaint=new Paint(1),mGridPaint=new Paint(1),mLabelPaint=new Paint(1); static int levelColor(float a){if(a>=0.7f)return 0xFFFF2200;if(a>=0.3f)return 0xFFFFBB00;return 0xFF00CC55;} OscilloscopeView(Context c){ super(c); setBackgroundColor(0x00000000); mWavePaint.setStrokeWidth(1.8f*c.getResources().getDisplayMetrics().density); mWavePaint.setStyle(Paint.Style.STROKE); mWavePaint.setStrokeCap(Paint.Cap.ROUND); mGridPaint.setColor(0x33FFFFFF); mGridPaint.setStrokeWidth(0.8f); mGridPaint.setStyle(Paint.Style.STROKE); mLabelPaint.setColor(0xAAFFFFFF); mLabelPaint.setTextSize(9*c.getResources().getDisplayMetrics().density); mLabelPaint.setAntiAlias(true); } void pushSamples(short[] b,int len,int ch){ synchronized(mLock){ for(int i=0;i<len;i+=ch){float mono=b[i]/32768f;if(ch==2&&i+1<len)mono=(mono+b[i+1]/32768f)*0.5f;mRingBuf[mWritePos]=mono;mWritePos=(mWritePos+1)%BUF_SIZE;} int trigPos=-1,searchStart=(mWritePos-BUF_SIZE+BUF_SIZE)%BUF_SIZE; for(int k=TRIG_HYSTERESIS;k<BUF_SIZE-DISP_SAMPLES;k++){int p=(searchStart+k)%BUF_SIZE;if(mRingBuf[(p-1+BUF_SIZE)%BUF_SIZE]<TRIG_LEVEL&&mRingBuf[p]>=TRIG_LEVEL){trigPos=p;break;}} if(trigPos<0)trigPos=(mWritePos-DISP_SAMPLES+BUF_SIZE)%BUF_SIZE; for(int k=0;k<DISP_SAMPLES;k++)mFrame[k]=mRingBuf[(trigPos+k)%BUF_SIZE]; mNewFrame=true; } postInvalidate(); } @Override protected void onDraw(Canvas g){ float w=getWidth(),h=getHeight();if(w==0||h==0)return; for(int i=1;i<4;i++)g.drawLine(w*i/4f,0,w*i/4f,h,mGridPaint); for(int i=1;i<4;i++)g.drawLine(0,h*i/4f,w,h*i/4f,mGridPaint); Paint zp=new Paint(mGridPaint);zp.setColor(0x55FFFFFF);zp.setStrokeWidth(1.4f);g.drawLine(0,h/2f,w,h/2f,zp); Paint tp=new Paint();tp.setColor(0x88FFFF00);tp.setStrokeWidth(1f);tp.setStyle(Paint.Style.STROKE);tp.setPathEffect(new DashPathEffect(new float[]{6f,4f},0));g.drawLine(0,h/2f-TRIG_LEVEL*h/2f,w,h/2f-TRIG_LEVEL*h/2f,tp); float[] frame; synchronized(mLock){frame=mFrame.clone();} for(int i=0;i<DISP_SAMPLES-1;i++){float x0=i*w/(DISP_SAMPLES-1f),x1=(i+1)*w/(DISP_SAMPLES-1f),y0=h/2f-frame[i]*h/2f*0.92f,y1=h/2f-frame[i+1]*h/2f*0.92f;g.drawLine(x0,y0,x1,y1,mWavePaint);} g.drawText("OSC  T↑",4,h-3f,mLabelPaint); } }
+    static class EnvelopeView extends View { private static final int HIST=1000,CHUNK=441; private float[] mEnv=new float[HIST]; private int mWritePos=0,mFilled=0; private float mAccPeak=0f; private int mAccCount=0; private Object mLock=new Object(); private Paint mSegPaint=new Paint(1),mGridPaint=new Paint(1),mLabelPaint=new Paint(1); EnvelopeView(Context c){ super(c); setBackgroundColor(0x00000000); float d=c.getResources().getDisplayMetrics().density; mSegPaint.setStyle(Paint.Style.STROKE); mSegPaint.setStrokeWidth(1.6f*d); mSegPaint.setStrokeCap(Paint.Cap.ROUND); mGridPaint.setColor(0x33FFFFFF); mGridPaint.setStrokeWidth(0.8f); mGridPaint.setStyle(Paint.Style.STROKE); mLabelPaint.setColor(0xAAFFFFFF); mLabelPaint.setTextSize(9*d); mLabelPaint.setAntiAlias(true); } void pushSamples(short[] b,int len,int ch){ synchronized(mLock){ for(int i=0;i<len;i+=ch){float s=Math.abs(b[i]/32768f);if(ch==2&&i+1<len)s=Math.max(s,Math.abs(b[i+1]/32768f));if(s>mAccPeak)mAccPeak=s;mAccCount++;if(mAccCount>=CHUNK){mEnv[mWritePos]=mAccPeak;mWritePos=(mWritePos+1)%HIST;if(mFilled<HIST)mFilled++;mAccPeak=0f;mAccCount=0;}} } postInvalidate(); } @Override protected void onDraw(Canvas g){ float w=getWidth(),h=getHeight();if(w==0||h==0)return; for(int i=1;i<4;i++)g.drawLine(w*i/4f,0,w*i/4f,h,mGridPaint); for(int i=1;i<4;i++)g.drawLine(0,h*i/4f,w,h*i/4f,mGridPaint); Paint zp=new Paint(mGridPaint);zp.setColor(0x55FFFFFF);zp.setStrokeWidth(1.4f);g.drawLine(0,h/2f,w,h/2f,zp); float[] snap; int filled,wp; synchronized(mLock){snap=mEnv.clone();filled=mFilled;wp=mWritePos;} if(filled<2){mLabelPaint.setColor(0xAAFFFFFF);g.drawText("ENV  10s",4,h-3f,mLabelPaint);return;} int count=Math.min(filled,HIST),start=(filled<HIST)?0:wp; for(int i=0;i<count-1;i++){ float a0=snap[(start+i)%HIST],a1=snap[(start+i+1)%HIST]; float x0=i*w/(count-1f),x1=(i+1)*w/(count-1f); float yT0=h/2f-a0*h/2f*0.92f,yT1=h/2f-a1*h/2f*0.92f,yB0=h/2f+a0*h/2f*0.92f,yB1=h/2f+a1*h/2f*0.92f; mSegPaint.setColor(OscilloscopeView.levelColor((a0+a1)*0.5f)); g.drawLine(x0,yT0,x1,yT1,mSegPaint); g.drawLine(x0,yB0,x1,yB1,mSegPaint); } Paint cp=new Paint();cp.setColor(0x66FFFFFF);cp.setStrokeWidth(1f);g.drawLine(w-1f,0,w-1f,h,cp); mLabelPaint.setColor(0xAAFFFFFF);g.drawText("ENV  10s",4,h-3f,mLabelPaint); } }
+    static class SpectrumView extends View { private static final int FFT_SIZE=2048,HALF=FFT_SIZE/2; private float[] mAccBuf=new float[FFT_SIZE]; private int mAccPos=0; private float[] mMagnitude=new float[HALF],mSmooth=new float[HALF],mPeaks=new float[HALF]; private Object mLock=new Object(); private float[] mFftRe=new float[FFT_SIZE],mFftIm=new float[FFT_SIZE],mWindow=new float[FFT_SIZE]; private Paint mBarPaint=new Paint(1),mPeakPaint=new Paint(1),mLblPaint=new Paint(1),mBgPaint=new Paint(); private static final int DISPLAY_BINS=60; private static final float SAMPLE_RATE=44100f,DECAY=0.82f,PEAK_DECAY=0.996f; SpectrumView(Context c){ super(c); for(int i=0;i<FFT_SIZE;i++)mWindow[i]=0.5f*(1f-(float)Math.cos(2.0*Math.PI*i/(FFT_SIZE-1))); mBarPaint.setStyle(Paint.Style.FILL); mPeakPaint.setStyle(Paint.Style.STROKE); mPeakPaint.setColor(0xFFFFFFFF); mPeakPaint.setStrokeWidth(1.5f); mLblPaint.setColor(0xCCFFFFFF); mLblPaint.setTextSize(7.5f*c.getResources().getDisplayMetrics().density); mLblPaint.setAntiAlias(true); mBgPaint.setColor(0x00000000); } void pushSamples(short[] b,int len,int ch){ for(int i=0;i<len;i+=ch){float mono=b[i]/32768f;if(ch==2&&i+1<len)mono=(mono+b[i+1]/32768f)*0.5f;mAccBuf[mAccPos++]=mono;if(mAccPos>=FFT_SIZE){computeFFT();System.arraycopy(mAccBuf,FFT_SIZE/2,mAccBuf,0,FFT_SIZE/2);mAccPos=FFT_SIZE/2;}} } private void computeFFT(){ for(int i=0;i<FFT_SIZE;i++){mFftRe[i]=mAccBuf[i]*mWindow[i];mFftIm[i]=0f;} int n=FFT_SIZE; for(int i=1,j=0;i<n;i++){int bit=n>>1;for(;(j&bit)!=0;bit>>=1)j^=bit;j^=bit;if(i<j){float tr=mFftRe[i];mFftRe[i]=mFftRe[j];mFftRe[j]=tr;float ti=mFftIm[i];mFftIm[i]=mFftIm[j];mFftIm[j]=ti;}} for(int len=2;len<=n;len<<=1){double ang=-2.0*Math.PI/len;float wRe=(float)Math.cos(ang),wIm=(float)Math.sin(ang); for(int i=0;i<n;i+=len){float curRe=1f,curIm=0f; for(int k=0;k<len/2;k++){float uRe=mFftRe[i+k],uIm=mFftIm[i+k]; float vRe=mFftRe[i+k+len/2]*curRe-mFftIm[i+k+len/2]*curIm; float vIm=mFftRe[i+k+len/2]*curIm+mFftIm[i+k+len/2]*curRe; mFftRe[i+k]=uRe+vRe;mFftIm[i+k]=uIm+vIm; mFftRe[i+k+len/2]=uRe-vRe;mFftIm[i+k+len/2]=uIm-vIm; float nRe=curRe*wRe-curIm*wIm;curIm=curRe*wIm+curIm*wRe;curRe=nRe;}}} synchronized(mLock){ for(int i=0;i<HALF;i++){float mag=(float)Math.sqrt(mFftRe[i]*mFftRe[i]+mFftIm[i]*mFftIm[i])/(FFT_SIZE/2f); float db=mag>1e-9f?Math.max(-90f,(float)(20.0*Math.log10(mag))):-90f; float norm=(db+90f)/90f; mMagnitude[i]=norm;mSmooth[i]=Math.max(norm,mSmooth[i]*DECAY);mPeaks[i]=Math.max(mSmooth[i],mPeaks[i]*PEAK_DECAY);} } postInvalidate(); } @Override protected void onDraw(Canvas g){ float w=getWidth(),h=getHeight();if(w==0||h==0)return; float lblH=mLblPaint.getTextSize()+4f,barTop=lblH,barAreaH=h-barTop; float[] freqMarks={50,100,200,500,1000,2000,5000,10000,20000}; String[] freqLabels={"50","100","200","500","1k","2k","5k","10k","20k"}; float fMin=(float)Math.log10(20.0),fMax=(float)Math.log10(SAMPLE_RATE/2f); Paint gp=new Paint();gp.setColor(0x44FFFFFF);gp.setStrokeWidth(0.8f); for(int i=0;i<freqMarks.length;i++){if(freqMarks[i]>SAMPLE_RATE/2f)break; float xf=((float)Math.log10(freqMarks[i])-fMin)/(fMax-fMin)*w; g.drawLine(xf,barTop,xf,h,gp);} float[] smooth,peaks; synchronized(mLock){smooth=mSmooth.clone();peaks=mPeaks.clone();} float logFMin=(float)Math.log10(Math.max(1f,20f)),logFMaxV=(float)Math.log10(SAMPLE_RATE/2f); for(int b=0;b<DISPLAY_BINS;b++){ float logF0=logFMin+(float)b/DISPLAY_BINS*(logFMaxV-logFMin),logF1=logFMin+(float)(b+1)/DISPLAY_BINS*(logFMaxV-logFMin); float f0=(float)Math.pow(10.0,logF0),f1=(float)Math.pow(10.0,logF1); int bin0=Math.max(0,Math.round(f0/SAMPLE_RATE*FFT_SIZE)),bin1=Math.min(HALF-1,Math.round(f1/SAMPLE_RATE*FFT_SIZE)); float val=0f,pk=0f; for(int i=bin0;i<=bin1;i++){if(smooth[i]>val)val=smooth[i];if(peaks[i]>pk)pk=peaks[i];} float x0=(float)b/DISPLAY_BINS*w,x1=(float)(b+1)/DISPLAY_BINS*w-1f;if(x1<x0+0.5f)x1=x0+0.5f; int red=Math.min(255,(int)(val*510f)),green=Math.min(255,(int)((1f-val)*510f)); mBarPaint.setColor(0xDD000000|(red<<16)|(green<<8)|0x22); float barH=val*barAreaH; g.drawRect(x0,h-barH,x1,h,mBarPaint); if(pk>0.02f){float peakY=h-pk*barAreaH;g.drawLine(x0,peakY,x1,peakY,mPeakPaint);} } float labelY=lblH-4f,prevLblRight=-1f; mLblPaint.setTextAlign(Paint.Align.CENTER); for(int i=0;i<freqMarks.length;i++){if(freqMarks[i]>SAMPLE_RATE/2f)break; float xf=((float)Math.log10(freqMarks[i])-fMin)/(fMax-fMin)*w; float lblW=mLblPaint.measureText(freqLabels[i]),lblX=xf-lblW/2f; if(lblX>prevLblRight&&lblX+lblW<w-2f){g.drawText(freqLabels[i],xf,labelY,mLblPaint);prevLblRight=lblX+lblW+3f;} } } }
 }
