@@ -572,7 +572,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		// Чекбокс EIS: блокируется во время записи, чтобы не сбросить стабилизатор
 		// и не нарушить синхронизацию кольцевого буфера.
 		mCbEis = new CheckBox(this);
-		mCbEis.setText("HW EIS");
+		mCbEis.setText("ImageStab");
 		mCbEis.setTextColor(0xCCCCCCCC);
 		mCbEis.setTextSize(12);
 		mCbEis.setEnabled(false); // разблокируется после openCamera, если устройство поддерживает
