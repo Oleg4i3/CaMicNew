@@ -332,12 +332,25 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		pipBorder.setStroke(dp(2), 0x88FFCC00);
 		pipBorder.setColor(0x00000000);
 		mPipView.setBackground(pipBorder);
-		// Почти на весь экран; отступ dp(40) по краям — видна "дрожащая рамка" из mSv
-		FrameLayout.LayoutParams pipLP = new FrameLayout.LayoutParams(
-			ViewGroup.LayoutParams.MATCH_PARENT,
-			ViewGroup.LayoutParams.MATCH_PARENT);
-		pipLP.setMargins(dp(40), dp(40), dp(40), dp(40));
-		root.addView(mPipView, pipLP);
+		// Вычисляем размер PiP с сохранением 16:9 по реальному размеру дисплея.
+		// Приложение работает в ландшафте: ширина > высоты.
+		// Оставляем ~dp(30) с каждой стороны — видна "дрожащая рамка" из mSv.
+		{
+			android.util.DisplayMetrics dm = new android.util.DisplayMetrics();
+			getWindowManager().getDefaultDisplay().getMetrics(dm);
+			int scrW = dm.widthPixels;
+			int scrH = dm.heightPixels;
+			int margin = dp(30);
+			int pipH = scrH - 2 * margin;
+			int pipW = pipH * 16 / 9;
+			if (pipW > scrW - 2 * margin) {
+				pipW = scrW - 2 * margin;
+				pipH = pipW * 9 / 16;
+			}
+			FrameLayout.LayoutParams pipLP = new FrameLayout.LayoutParams(pipW, pipH);
+			pipLP.gravity = android.view.Gravity.CENTER;
+			root.addView(mPipView, pipLP);
+		}
 
 
 
@@ -478,10 +491,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		
 		// Схлопываемая панель: спиннер + soft clip + manual focus
 		// Центрируем по экрану — слайдер Gain слева не перекрывает
+		// Схлопываемая панель: два столбца рядом.
+		// col1 — основные настройки; col2 — битрейт.
 		mAudioSrcPanel = new LinearLayout(this);
-		mAudioSrcPanel.setOrientation(LinearLayout.VERTICAL);
+		mAudioSrcPanel.setOrientation(LinearLayout.HORIZONTAL);
 		mAudioSrcPanel.setVisibility(View.GONE);
 		mAudioSrcPanel.setPadding(dp(8), dp(4), dp(8), dp(4));
+
+		LinearLayout settingsCol1 = new LinearLayout(this);
+		settingsCol1.setOrientation(LinearLayout.VERTICAL);
+		settingsCol1.setPadding(0, 0, dp(16), 0);
+
+		LinearLayout settingsCol2 = new LinearLayout(this);
+		settingsCol2.setOrientation(LinearLayout.VERTICAL);
 		
 		mSpinner = new Spinner(this);
 		ArrayAdapter<String> ad = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item,
@@ -509,7 +531,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		srcRow.setGravity(Gravity.CENTER_VERTICAL);
 		srcRow.addView(smallLabel("Src: "));
 		srcRow.addView(mSpinner);
-		mAudioSrcPanel.addView(srcRow);
+		settingsCol1.addView(srcRow);
 		
 		mCbSoftClip = new CheckBox(this);
 		mCbSoftClip.setText("Soft clip");
@@ -544,7 +566,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		cbRow.setGravity(Gravity.CENTER_VERTICAL);
 		cbRow.addView(mCbSoftClip);
 		cbRow.addView(mCbManualFocus);
-		mAudioSrcPanel.addView(cbRow);
+		settingsCol1.addView(cbRow);
 
 		// ── Hardware EIS ─────────────────────────────────────────────────────
 		// Чекбокс EIS: блокируется во время записи, чтобы не сбросить стабилизатор
@@ -598,7 +620,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		cbRow2.setGravity(Gravity.CENTER_VERTICAL);
 		cbRow2.addView(mCbOsc);
 		cbRow2.addView(mCbSpec);
-		mAudioSrcPanel.addView(cbRow2);
+		settingsCol1.addView(cbRow2);
 		
 		// Focus Assist
 		mCbFocusAssist = new CheckBox(this);
@@ -606,7 +628,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mCbFocusAssist.setTextColor(0xCCCCCCCC);
 		mCbFocusAssist.setTextSize(12);
 		mCbFocusAssist.setVisibility(View.GONE);
-		mAudioSrcPanel.addView(mCbFocusAssist);
+		settingsCol1.addView(mCbFocusAssist);
 
 		// ── EV ──────────────────────────────────────────────────────────────
 		mTvEv = smallLabel("EV  0");
@@ -624,7 +646,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		LinearLayout evRow = new LinearLayout(this);
 		evRow.setOrientation(LinearLayout.HORIZONTAL); evRow.setGravity(Gravity.CENTER_VERTICAL);
 		evRow.addView(mTvEv); evRow.addView(mSeekEv);
-		mAudioSrcPanel.addView(evRow);
+		settingsCol1.addView(evRow);
 
 		// ── Pre-buffer ───────────────────────────────────────────────────────
 		CheckBox cbPB = new CheckBox(this);
@@ -646,7 +668,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		LinearLayout pbRow = new LinearLayout(this);
 		pbRow.setOrientation(LinearLayout.HORIZONTAL); pbRow.setGravity(Gravity.CENTER_VERTICAL);
 		pbRow.addView(cbPB); pbRow.addView(sbPB); pbRow.addView(tvPBLen);
-		mAudioSrcPanel.addView(pbRow);
+		settingsCol1.addView(pbRow);
 
 		// ── Битрейт видео ────────────────────────────────────────────────────
 		String[] bpsL={"500 kbps","1 Mbps","2 Mbps","3 Mbps","4 Mbps","6 Mbps (def)","8 Mbps","12 Mbps"};
@@ -663,7 +685,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		LinearLayout bpsRow = new LinearLayout(this);
 		bpsRow.setOrientation(LinearLayout.HORIZONTAL); bpsRow.setGravity(Gravity.CENTER_VERTICAL);
 		bpsRow.addView(smallLabel("Bps: ")); bpsRow.addView(spBps);
-		mAudioSrcPanel.addView(bpsRow);
+		settingsCol2.addView(smallLabel("Bitrate:"));
+		settingsCol2.addView(bpsRow);
+		mAudioSrcPanel.addView(settingsCol1);
+		mAudioSrcPanel.addView(settingsCol2);
 
 		panel.addView(mAudioSrcPanel);
 
@@ -2132,7 +2157,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		
 		// Визуальный «угол» барабана — непрерывный для анимации рисок
 		private float mAngle = 0f;
-		private static final float FULL_RANGE_PX_PER_UNIT = 800f;
+		private static final float FULL_RANGE_PX_PER_UNIT = 4000f; // 5× плавнее оригинала
 		
 		private final Paint mDrumPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 		private final Paint mRiskPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
