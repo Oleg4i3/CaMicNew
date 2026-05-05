@@ -28,10 +28,8 @@ import android.media.audiofx.AutomaticGainControl;
 import android.media.audiofx.NoiseSuppressor;
 import android.media.audiofx.AcousticEchoCanceler;
 
-import android.hardware.Sensor;
-import android.hardware.SensorEvent;
-import android.hardware.SensorEventListener;
-import android.hardware.SensorManager;
+import android.media.Image;
+import android.media.ImageReader;
 
 import java.io.File;
 import java.nio.ByteBuffer;
@@ -116,28 +114,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	/** true — железо поддерживает VIDEO_STABILIZATION_MODE_ON */
 	private volatile boolean mEisSupported = false;
 
-	// ─── EIS crop overlay ────────────────────────────────────────────────────
+	// ─── EIS PiP monitor (ImageReader) ────────────────────────────────────────
 	/**
-	 * Оверлей превью: тёмная рамка = зона кропа EIS, анимируется по гироскопу.
-	 * Отображается только когда EIS включён.
+	 * Реальный монитор EIS: третья поверхность в capture session.
+	 * Получает тот же стабилизированный стрим, что идёт в энкодер.
+	 *
+	 * Почему именно ImageReader, а не гироскоп:
+	 *   HW EIS использует кросс-корреляцию кадров внутри ISP/DSP — алгоритм
+	 *   не привязан напрямую к гироскопу и может давать систематические
+	 *   смещения (например, в нижний левый угол), которые гироскоп не покажет.
+	 *   ImageReader получает кадр ПОСЛЕ стабилизатора — это и есть реальный
+	 *   выход в файл.
 	 */
-	private EisCropOverlay mEisOverlay;
-	private SensorManager mSensorMgr;
-	private Sensor mGyro;
-	// Накопленный угол отклонения (рад) по горизонтали и вертикали
-	private float mGyroAngleX = 0f, mGyroAngleY = 0f;
-	private long mGyroLastNs  = 0L;
-	/**
-	 * Типичный коэффициент кропа EIS: 0.88 → 6% полей с каждой стороны.
-	 * Реальное значение зависит от драйвера камеры и не раскрывается через API.
-	 * 0.88 — консервативная оценка, соответствует большинству Qualcomm/MediaTek SoC.
-	 */
-	static final float EIS_CROP = 0.88f;
-	/**
-	 * Скорость коррекции стабилизатора (decay per sample @ 200 Hz).
-	 * Имитирует поведение EIS: медленный дрейф постепенно возвращается к центру.
-	 */
-	static final float EIS_DECAY = 0.985f;
+	private ImageReader   mPipReader;
+	private ImageView     mPipView;
+	private HandlerThread mPipThread;
+	private Handler       mPipHandler;
+	/** Счётчик для пропуска кадров (показываем каждый 3-й → ~10 fps) */
+	private int mPipFrameSkip = 0;
+	/** Размер PiP-кадра — 1/4 от видео, быстрое YUV→RGB */
+	private static final int PIP_W = 320, PIP_H = 180;
 	
 	// ─── Запись ───────────────────────────────────────────────────────────────
 	private volatile boolean mRecording;
@@ -243,24 +239,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	@Override
 	protected void onResume() {
 		super.onResume();
-		if (mEisEnabled) startEisOverlay();
+		// Перезапускаем PiP только если EIS был включён до паузы
+		if (mEisEnabled && mEisSupported) startEisOverlay();
 	}
 
 	@Override
 	protected void onPause() {
 		super.onPause();
 		if (mRecording) mRecording = false;
-		stopEisOverlay(); // освобождаем гироскоп в фоне
+		stopEisOverlay(); // освобождаем ImageReader и PiP поток
 	}
 	
 	@Override
 	protected void onDestroy() {
 		super.onDestroy();
 		if (mCamHandler != null)
-		mCamHandler.removeCallbacks(mZoomRunnable);
+			mCamHandler.removeCallbacks(mZoomRunnable);
 		mVidLoopRunning = false;
 		stopAudio();
 		finalizeMuxer();
+		// EIS PiP cleanup
+		if (mPipReader != null) { mPipReader.close(); mPipReader = null; }
+		if (mPipThread != null) { mPipThread.quitSafely(); mPipThread = null; }
 		if (mVidEnc!=null){try{mVidEnc.stop();mVidEnc.release();}catch(Exception e){} mVidEnc=null;}
 		if (mEncSurface!=null){try{mEncSurface.release();}catch(Exception e){} mEncSurface=null;}
 		try {
@@ -310,11 +310,37 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		svLP.gravity = Gravity.CENTER;
 		root.addView(mSv, svLP);
 
-		// ── EIS crop overlay — поверх SurfaceView, под остальными виджетами ───
-		mEisOverlay = new EisCropOverlay(this);
-		mEisOverlay.setVisibility(View.GONE); // показывается только при включённом EIS
-		root.addView(mEisOverlay, new FrameLayout.LayoutParams(
-			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+		// ── EIS PiP monitor — показывает реальный стабилизированный выход ─────
+		// Позиционируем в правом верхнем углу (не перекрывает управление).
+		// GONE пока EIS выключен.
+		mPipView = new ImageView(this);
+		mPipView.setScaleType(ImageView.ScaleType.FIT_CENTER);
+		mPipView.setVisibility(View.GONE);
+		// Рамка: жёлтая → "это то, что идёт в файл"
+		GradientDrawable pipBorder = new GradientDrawable();
+		pipBorder.setStroke(dp(2), 0xFFFFCC00);
+		pipBorder.setColor(0x00000000);
+		mPipView.setBackground(pipBorder);
+		int pipW = dp(200), pipH = dp(113); // 16:9
+		FrameLayout.LayoutParams pipLP = new FrameLayout.LayoutParams(pipW, pipH);
+		pipLP.gravity = Gravity.TOP | Gravity.RIGHT;
+		pipLP.topMargin  = dp(6);
+		pipLP.rightMargin = dp(60); // не перекрывать зум-рычаг
+		root.addView(mPipView, pipLP);
+
+		// Подпись над PiP
+		TextView tvPipLabel = new TextView(this);
+		tvPipLabel.setText("▶ EIS out");
+		tvPipLabel.setTextColor(0xFFFFCC00);
+		tvPipLabel.setTextSize(10);
+		tvPipLabel.setTag("pip_label");
+		tvPipLabel.setVisibility(View.GONE);
+		FrameLayout.LayoutParams lblLP = new FrameLayout.LayoutParams(
+			ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+		lblLP.gravity = Gravity.TOP | Gravity.RIGHT;
+		lblLP.topMargin  = dp(2);
+		lblLP.rightMargin = dp(60);
+		root.addView(tvPipLabel, lblLP);
 
 		// ── Осциллограф — прозрачный оверлей, верхняя часть кадра ─────────
 		mOscilloscope = new OscilloscopeView(this);
@@ -969,33 +995,38 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	}
 	
 	private void startPreview() {
-		if (mCamDev == null || !mSurfaceReady)
-		return;
+		if (mCamDev == null || !mSurfaceReady) return;
 		ensureEncoders();
 		try {
-			if (mCapSess != null) {
-				mCapSess.close();
-				mCapSess = null;
-			}
+			if (mCapSess != null) { mCapSess.close(); mCapSess = null; }
+
 			Surface preview = mSv.getHolder().getSurface();
 			List<Surface> targets = new ArrayList<>();
 			targets.add(preview);
 			if (mEncSurface != null && mEncSurface.isValid())
-			targets.add(mEncSurface);
-			
+				targets.add(mEncSurface);
+
+			// ── EIS PiP: добавляем ImageReader как третий таргет ─────────────
+			// Важно: ImageReader добавляется только когда EIS включён — лишний
+			// стрим увеличивает нагрузку на шину ISP и может снизить FPS.
+			// Размер PIP_W×PIP_H (320×180) заведомо меньше RECORD_SIZE → на всех
+			// устройствах попадает в допустимую комбинацию стримов (PRIV+PRIV+YUV).
+			if (mEisEnabled && mEisSupported && mPipReader != null) {
+				targets.add(mPipReader.getSurface());
+			}
+
 			mCamDev.createCaptureSession(targets, new CameraCaptureSession.StateCallback() {
 				@Override
 				public void onConfigured(CameraCaptureSession sess) {
 					mCapSess = sess;
 					buildAndSendRequest();
 				}
-				
 				@Override
 				public void onConfigureFailed(CameraCaptureSession sess) {
 					status("Session config failed");
 				}
 			}, mCamHandler);
-			} catch (Exception e) {
+		} catch (Exception e) {
 			status("startPreview: " + e.getMessage());
 		}
 	}
@@ -1014,7 +1045,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			CaptureRequest.Builder rb = dev.createCaptureRequest(tmpl);
 			rb.addTarget(preview);
 			if (mEncSurface != null && mEncSurface.isValid())
-			rb.addTarget(mEncSurface);
+				rb.addTarget(mEncSurface);
+			// PiP reader должен быть таргетом в запросе, иначе кадры не придут
+			if (mEisEnabled && mEisSupported && mPipReader != null) {
+				rb.addTarget(mPipReader.getSurface());
+			}
 			
 			if (mManualFocus) {
 				// Ручной фокус: переводим прогресс (0=∞, 1=macro) в диоптрии
@@ -1040,11 +1075,25 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					: CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF);
 			
 			if (mSensorRect != null) {
-				int cropW = Math.max(1, (int) (mSensorRect.width() / mZoomLevel));
-				int cropH = Math.max(1, (int) (mSensorRect.height() / mZoomLevel));
-				int cropX = mSensorRect.left + (mSensorRect.width() - cropW) / 2;
-				int cropY = mSensorRect.top + (mSensorRect.height() - cropH) / 2;
-				rb.set(CaptureRequest.SCALER_CROP_REGION, new Rect(cropX, cropY, cropX + cropW, cropY + cropH));
+				if (mEisEnabled && mEisSupported) {
+					// ── EIS активен: НЕЛЬЗЯ выставлять суженный SCALER_CROP_REGION ─────
+					// Аппаратный EIS использует запас по краям сенсора для компенсации
+					// движения. Если мы одновременно задаём смещённый кроп (зум),
+					// камера игнорирует cropX/cropY, сохраняя cropW/cropH: кроп идёт
+					// не из центра сенсора, а с угла (0,0) — отсюда несимметричный срез
+					// справа и сверху, пропорциональный зуму.
+					// Решение (по документации Camera2): при активном EIS выставлять
+					// SCALER_CROP_REGION равным полному активному массиву — EIS сам
+					// управляет кропом и выдаёт правильно центрированный стабилизированный
+					// кадр на все выходные поверхности.
+					rb.set(CaptureRequest.SCALER_CROP_REGION, mSensorRect);
+				} else {
+					int cropW = Math.max(1, (int) (mSensorRect.width() / mZoomLevel));
+					int cropH = Math.max(1, (int) (mSensorRect.height() / mZoomLevel));
+					int cropX = mSensorRect.left + (mSensorRect.width() - cropW) / 2;
+					int cropY = mSensorRect.top + (mSensorRect.height() - cropH) / 2;
+					rb.set(CaptureRequest.SCALER_CROP_REGION, new Rect(cropX, cropY, cropX + cropW, cropY + cropH));
+				}
 			}
 			sess.setRepeatingRequest(rb.build(), null, mCamHandler);
 			} catch (Exception ignored) {
@@ -2654,212 +2703,129 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	}
 
 	// =========================================================================
-	// EIS crop overlay helpers
+	// EIS PiP helpers
 	// =========================================================================
 
 	/**
-	 * Регистрируем гироскоп и показываем оверлей.
-	 * Вызывается когда EIS включён (чекбокс + onResume).
+	 * Создаём ImageReader, запускаем фоновый поток конвертации YUV→Bitmap,
+	 * показываем PiP-оверлей, пересоздаём capture session с новой поверхностью.
+	 *
+	 * Порядок важен: сначала создать ImageReader, потом пересоздать сессию —
+	 * иначе в targets окажется null-поверхность.
 	 */
 	private void startEisOverlay() {
-		if (mEisOverlay == null) return;
-		if (mSensorMgr == null)
-			mSensorMgr = (SensorManager) getSystemService(SENSOR_SERVICE);
-		if (mSensorMgr != null && mGyro == null) {
-			mGyro = mSensorMgr.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
-			if (mGyro != null) {
-				mSensorMgr.registerListener(mGyroListener, mGyro,
-					SensorManager.SENSOR_DELAY_GAME); // ~50–200 Hz
-			}
+		// Фоновый поток для YUV-конвертации (не блокирует UI и camera-поток)
+		if (mPipThread == null || !mPipThread.isAlive()) {
+			mPipThread = new HandlerThread("eis-pip");
+			mPipThread.start();
+			mPipHandler = new Handler(mPipThread.getLooper());
 		}
-		mGyroAngleX = 0f;
-		mGyroAngleY = 0f;
-		mGyroLastNs = 0L;
-		mEisOverlay.setVisibility(View.VISIBLE);
+		// ImageReader: YUV_420_888, 320×180, double-buffered
+		if (mPipReader != null) { mPipReader.close(); mPipReader = null; }
+		mPipReader = ImageReader.newInstance(PIP_W, PIP_H,
+				android.graphics.ImageFormat.YUV_420_888, /*maxImages=*/ 2);
+		mPipFrameSkip = 0;
+
+		mPipReader.setOnImageAvailableListener(reader -> {
+			// Пропускаем 2 из 3 кадров → ~10 fps на дисплее
+			mPipFrameSkip++;
+			if (mPipFrameSkip % 3 != 0) {
+				// Обязательно закрываем — иначе буфер переполнится и новые кадры перестанут приходить
+				Image img = reader.acquireLatestImage();
+				if (img != null) img.close();
+				return;
+			}
+			Image img = reader.acquireLatestImage();
+			if (img == null) return;
+			try {
+				Bitmap bmp = yuv420ToBitmap(img);
+				runOnUiThread(() -> {
+					if (mPipView != null) mPipView.setImageBitmap(bmp);
+				});
+			} finally {
+				img.close();
+			}
+		}, mPipHandler);
+
+		// Показываем PiP и подпись
+		runOnUiThread(() -> {
+			if (mPipView != null) mPipView.setVisibility(View.VISIBLE);
+			// Находим подпись по тегу
+			View root = mPipView.getRootView();
+			View lbl = root.findViewWithTag("pip_label");
+			if (lbl != null) lbl.setVisibility(View.VISIBLE);
+		});
+
+		// Пересоздаём capture session — теперь с ImageReader в targets
+		if (mCamHandler != null) mCamHandler.post(this::startPreview);
 	}
 
 	/**
-	 * Снимаем регистрацию гироскопа и скрываем оверлей.
-	 * Вызывается когда EIS выключен или приложение уходит в фон.
+	 * Скрываем PiP, освобождаем ImageReader, пересоздаём сессию без него.
 	 */
 	private void stopEisOverlay() {
-		if (mSensorMgr != null && mGyro != null) {
-			mSensorMgr.unregisterListener(mGyroListener);
-			mGyro = null;
+		runOnUiThread(() -> {
+			if (mPipView != null) {
+				mPipView.setVisibility(View.GONE);
+				mPipView.setImageBitmap(null);
+			}
+			View root = mPipView != null ? mPipView.getRootView() : null;
+			if (root != null) {
+				View lbl = root.findViewWithTag("pip_label");
+				if (lbl != null) lbl.setVisibility(View.GONE);
+			}
+		});
+		if (mPipReader != null) {
+			mPipReader.setOnImageAvailableListener(null, null);
+			mPipReader.close();
+			mPipReader = null;
 		}
-		if (mEisOverlay != null) mEisOverlay.setVisibility(View.GONE);
+		if (mPipThread != null) {
+			mPipThread.quitSafely();
+			mPipThread = null;
+			mPipHandler = null;
+		}
+		// Пересоздаём сессию без ImageReader
+		if (mCamHandler != null) mCamHandler.post(this::startPreview);
 	}
 
 	/**
-	 * Слушатель гироскопа.
+	 * Конвертация YUV_420_888 → ARGB_8888 Bitmap.
 	 *
-	 * Интегрируем угловую скорость → угол отклонения.
-	 * Применяем decay — имитируем коррекцию стабилизатора:
-	 * медленный дрейф не накапливается, а возвращается к нулю.
-	 * Затем передаём угол в оверлей как пиксельное смещение.
+	 * YUV_420_888 — полу-планарный или планарный формат.
+	 * Используем planes[0] (Y), planes[1] (U/Cb), planes[2] (V/Cr).
+	 * Формула BT.601 (стандарт для видео с камеры).
+	 *
+	 * Работает на фоновом потоке — не блокирует UI.
 	 */
-	private final SensorEventListener mGyroListener = new SensorEventListener() {
-		@Override
-		public void onSensorChanged(SensorEvent ev) {
-			if (mGyroLastNs == 0L) { mGyroLastNs = ev.timestamp; return; }
-			float dt = (ev.timestamp - mGyroLastNs) * 1e-9f; // сек
-			mGyroLastNs = ev.timestamp;
-			if (dt <= 0 || dt > 0.1f) return; // выброс
-
-			// Телефон в ландшафте:
-			//   ev.values[1] (pitch/Y) → горизонтальный сдвиг кадра
-			//   ev.values[0] (roll/X)  → вертикальный сдвиг кадра
-			// Знак подобран так, чтобы прямоугольник двигался «против» движения
-			// руки (туда же, куда EIS смещал бы кроп).
-			mGyroAngleX += ev.values[1] * dt;  // горизонталь
-			mGyroAngleY += ev.values[0] * dt;  // вертикаль
-
-			// Decay — EIS не удерживает постоянное смещение, он корректирует его
-			mGyroAngleX *= EIS_DECAY;
-			mGyroAngleY *= EIS_DECAY;
-
-			if (mEisOverlay != null && mEisOverlay.getVisibility() == View.VISIBLE) {
-				mEisOverlay.updateGyro(mGyroAngleX, mGyroAngleY);
+	private static Bitmap yuv420ToBitmap(Image image) {
+		Image.Plane[] p = image.getPlanes();
+		ByteBuffer yBuf = p[0].getBuffer();
+		ByteBuffer uBuf = p[1].getBuffer();
+		ByteBuffer vBuf = p[2].getBuffer();
+		int yRowStride  = p[0].getRowStride();
+		int uvRowStride = p[1].getRowStride();
+		int uvPixStride = p[1].getPixelStride(); // 1 (планарный) или 2 (полупланарный NV12/NV21)
+		int w = image.getWidth(), h = image.getHeight();
+		int[] argb = new int[w * h];
+		for (int row = 0; row < h; row++) {
+			for (int col = 0; col < w; col++) {
+				int yIdx  = row * yRowStride + col;
+				int uvIdx = (row >> 1) * uvRowStride + (col >> 1) * uvPixStride;
+				int Y = (yBuf.get(yIdx)         & 0xFF) - 16;
+				int U = (uBuf.get(uvIdx)         & 0xFF) - 128;
+				int V = (vBuf.get(uvIdx)         & 0xFF) - 128;
+				// BT.601 full-range
+				int r = (298 * Y           + 409 * V + 128) >> 8;
+				int g = (298 * Y - 100 * U - 208 * V + 128) >> 8;
+				int b = (298 * Y + 516 * U           + 128) >> 8;
+				argb[row * w + col] = 0xFF000000
+					| (Math.max(0, Math.min(255, r)) << 16)
+					| (Math.max(0, Math.min(255, g)) <<  8)
+					|  Math.max(0, Math.min(255, b));
 			}
 		}
-		@Override public void onAccuracyChanged(Sensor s, int a) {}
-	};
-
-	// =========================================================================
-	// EisCropOverlay — внутренний класс
-	// =========================================================================
-
-	/**
-	 * Прозрачный оверлей, показывающий предполагаемые границы стабилизированного
-	 * кадра в реальном времени.
-	 *
-	 * Принцип работы:
-	 *  1. EIS физически кропит сенсорный кадр на EIS_CROP (≈ 88%) по каждой оси.
-	 *     Это означает 6% «мёртвой зоны» с каждой стороны.
-	 *  2. Внутри этой зоны стабилизатор смещает окно просмотра, компенсируя тряску.
-	 *  3. Оверлей рисует тёмное затемнение вокруг «живого» окна и анимирует
-	 *     его смещение по данным гироскопа — чтобы оператор видел, что попадёт
-	 *     в итоговое видео.
-	 *
-	 * Угловые значения гироскопа переводятся в пиксели через приближённый FOV.
-	 * Точный FOV неизвестен, но ошибка ±20% не критична для визуальной индикации.
-	 */
-	private static class EisCropOverlay extends View {
-
-		// Краска для затемнения
-		private final Paint mDimPaint = new Paint();
-		// Краска для рамки стабилизированного кадра
-		private final Paint mBorderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-		// Краска для текстовой подписи
-		private final Paint mLabelPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-		// Временный Rect для вычислений
-		private final RectF mCropRect = new RectF();
-
-		// Текущее пиксельное смещение (обновляется из gyro listener)
-		private volatile float mOffsetX = 0f, mOffsetY = 0f;
-
-		/**
-		 * Горизонтальный FOV в радианах.
-		 * 60° — типичное значение для широкоугольной камеры телефона.
-		 * Используется только для scale-перевода угла в пиксели.
-		 */
-		private static final float FOV_RAD = (float) Math.toRadians(60.0);
-
-		EisCropOverlay(Context ctx) {
-			super(ctx);
-			setWillNotDraw(false);
-
-			mDimPaint.setColor(0xAA000000); // полупрозрачный чёрный
-			mDimPaint.setStyle(Paint.Style.FILL);
-
-			mBorderPaint.setColor(0xFFFFCC00); // жёлтый — хорошо виден
-			mBorderPaint.setStyle(Paint.Style.STROKE);
-			mBorderPaint.setStrokeWidth(3f);
-			// Пунктирная линия — не перекрывает критически превью
-			mBorderPaint.setPathEffect(new DashPathEffect(new float[]{14f, 6f}, 0f));
-
-			mLabelPaint.setColor(0xFFFFCC00);
-			mLabelPaint.setTextSize(28f);
-			mLabelPaint.setTextAlign(Paint.Align.LEFT);
-			mLabelPaint.setTypeface(Typeface.MONOSPACE);
-		}
-
-		/** Вызывается из SensorEventListener на любом потоке — только пишем volatile */
-		void updateGyro(float angleX, float angleY) {
-			// Приближённый focal length в пикселях на основе текущей ширины view
-			float w = getWidth();
-			float focalPx = w / (2f * (float) Math.tan(FOV_RAD / 2f));
-
-			// Перевод угла в пиксели (малый угол: tan ≈ angle)
-			float rawOffsetX =  angleX * focalPx;
-			float rawOffsetY = -angleY * focalPx;
-
-			// Максимально допустимое смещение = размер EIS-поля в пикселях
-			float marginX = w * (1f - EIS_CROP) / 2f;
-			float marginY = getHeight() * (1f - EIS_CROP) / 2f;
-
-			// Зажимаем: дальше края кропа стабилизатор не уйдёт
-			mOffsetX = Math.max(-marginX, Math.min(marginX, rawOffsetX));
-			mOffsetY = Math.max(-marginY, Math.min(marginY, rawOffsetY));
-
-			postInvalidate(); // инвалидируем из не-UI потока
-		}
-
-		@Override
-		protected void onDraw(Canvas canvas) {
-			int w = getWidth(), h = getHeight();
-			if (w == 0 || h == 0) return;
-
-			// ── Размеры стабилизированного окна ─────────────────────────────
-			float cropW = w * EIS_CROP;
-			float cropH = h * EIS_CROP;
-
-			// ── Смещение: центр кропа ≈ центр кадра + gyro offset ───────────
-			float cx = w * 0.5f + mOffsetX;
-			float cy = h * 0.5f + mOffsetY;
-
-			mCropRect.set(cx - cropW * 0.5f, cy - cropH * 0.5f,
-			              cx + cropW * 0.5f, cy + cropH * 0.5f);
-
-			// ── Затемнение: 4 полосы вокруг окна ────────────────────────────
-			// Левая
-			canvas.drawRect(0,            0, mCropRect.left,  h, mDimPaint);
-			// Правая
-			canvas.drawRect(mCropRect.right, 0, w,           h, mDimPaint);
-			// Верхняя (между левой и правой)
-			canvas.drawRect(mCropRect.left, 0, mCropRect.right, mCropRect.top, mDimPaint);
-			// Нижняя
-			canvas.drawRect(mCropRect.left, mCropRect.bottom, mCropRect.right, h, mDimPaint);
-
-			// ── Рамка стабилизированного окна ────────────────────────────────
-			canvas.drawRect(mCropRect, mBorderPaint);
-
-			// ── Угловые маркеры (Г-образные уголки) для чёткости ─────────────
-			float cm = Math.min(w, h) * 0.04f; // длина уголка
-			mBorderPaint.setPathEffect(null); // уголки без пунктира
-			// top-left
-			canvas.drawLine(mCropRect.left, mCropRect.top + cm, mCropRect.left,  mCropRect.top, mBorderPaint);
-			canvas.drawLine(mCropRect.left, mCropRect.top, mCropRect.left + cm,  mCropRect.top, mBorderPaint);
-			// top-right
-			canvas.drawLine(mCropRect.right - cm, mCropRect.top, mCropRect.right, mCropRect.top, mBorderPaint);
-			canvas.drawLine(mCropRect.right, mCropRect.top, mCropRect.right, mCropRect.top + cm, mBorderPaint);
-			// bottom-left
-			canvas.drawLine(mCropRect.left, mCropRect.bottom - cm, mCropRect.left, mCropRect.bottom, mBorderPaint);
-			canvas.drawLine(mCropRect.left, mCropRect.bottom, mCropRect.left + cm, mCropRect.bottom, mBorderPaint);
-			// bottom-right
-			canvas.drawLine(mCropRect.right - cm, mCropRect.bottom, mCropRect.right, mCropRect.bottom, mBorderPaint);
-			canvas.drawLine(mCropRect.right, mCropRect.bottom - cm, mCropRect.right, mCropRect.bottom, mBorderPaint);
-
-			// Возвращаем пунктир для следующего цикла
-			mBorderPaint.setPathEffect(new DashPathEffect(new float[]{14f, 6f}, 0f));
-
-			// ── Подпись EIS и процент кропа ───────────────────────────────────
-			canvas.drawText(
-				String.format("EIS  crop %.0f%%", (1f - EIS_CROP) * 100f * 2f),
-				mCropRect.left + cm + 6f,
-				mCropRect.top  + 28f,
-				mLabelPaint);
-		}
+		return Bitmap.createBitmap(argb, w, h, Bitmap.Config.ARGB_8888);
 	}
 
 }
