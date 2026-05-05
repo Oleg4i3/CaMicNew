@@ -2759,9 +2759,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 								inBuf.put(frame.data);
 								dec.queueInputBuffer(idx, 0, frame.data.length,
 									frame.pts, frame.flags & ~MediaCodec.BUFFER_FLAG_CODEC_CONFIG);
-							} else {
-								dec.releaseInputBuffer(idx);
 							}
+							// inBuf == null: просто не используем слот, он вернётся сам
 						}
 						// Если idx < 0 — декодер занят, кадр теряем (нормально для PiP)
 					}
