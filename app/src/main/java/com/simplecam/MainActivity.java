@@ -99,6 +99,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private boolean mPermsOk;
 	private int mSensorOrientation = 90;
 	private Rect mSensorRect;
+	/** PRE_CORRECTION_ACTIVE_ARRAY_SIZE — используется для расчёта SCALER_CROP_REGION при активном EIS.
+	 *  При EIS=ON камера интерпретирует SCALER_CROP_REGION в координатах этого прямоугольника. */
+	private Rect mPreCorrRect;
 	private float mMaxZoom = 1f;
 	private volatile float mZoomLevel = 1f;
 	private volatile float mZoomLeverPos = 0f;
@@ -114,26 +117,22 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	/** true — железо поддерживает VIDEO_STABILIZATION_MODE_ON */
 	private volatile boolean mEisSupported = false;
 
-	// ─── EIS PiP monitor (ImageReader) ────────────────────────────────────────
+	// ─── PiP: live-мониторинг того, что пишется в файл ───────────────────────
 	/**
-	 * Реальный монитор EIS: третья поверхность в capture session.
-	 * Получает тот же стабилизированный стрим, что идёт в энкодер.
-	 *
-	 * Почему именно ImageReader, а не гироскоп:
-	 *   HW EIS использует кросс-корреляцию кадров внутри ISP/DSP — алгоритм
-	 *   не привязан напрямую к гироскопу и может давать систематические
-	 *   смещения (например, в нижний левый угол), которые гироскоп не покажет.
-	 *   ImageReader получает кадр ПОСЛЕ стабилизатора — это и есть реальный
-	 *   выход в файл.
+	 * Архитектура PiP-монитора:
+	 *   Encoder (mVidEnc) уже получает стабилизированный кадр с камеры.
+	 *   Мы ответвляем его H.264-вывод в MediaCodec-декодер (mPipDec),
+	 *   который рендерит напрямую на Surface TextureView.
+	 *   Задержка ≈ encoder + decoder latency ≈ 2–5 кадров (~100–200 мс).
+	 *   PiP показывает ровно то, что идёт в файл — без дополнительного
+	 *   surface в capture session и без YUV-конвертации.
 	 */
-	private ImageReader   mPipReader;
-	private ImageView     mPipView;
-	private HandlerThread mPipThread;
-	private Handler       mPipHandler;
-	/** Счётчик для пропуска кадров (показываем каждый 3-й → ~10 fps) */
-	private int mPipFrameSkip = 0;
-	/** Размер PiP-кадра — 1/4 от видео, быстрое YUV→RGB */
-	private static final int PIP_W = 320, PIP_H = 180;
+	private TextureView   mPipView;
+	private MediaCodec    mPipDec;
+	private Surface       mPipDecSurface;
+	private volatile boolean mPipDecReady = false;
+	private Thread        mPipDecThread;
+	// PiP-декодер использует нативный размер TextureView — константы не нужны
 	
 	// ─── Запись ───────────────────────────────────────────────────────────────
 	private volatile boolean mRecording;
@@ -247,7 +246,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	protected void onPause() {
 		super.onPause();
 		if (mRecording) mRecording = false;
-		stopEisOverlay(); // освобождаем ImageReader и PiP поток
+		stopEisOverlay(); // скрываем PiP, освобождаем декодер
 	}
 	
 	@Override
@@ -258,9 +257,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mVidLoopRunning = false;
 		stopAudio();
 		finalizeMuxer();
-		// EIS PiP cleanup
-		if (mPipReader != null) { mPipReader.close(); mPipReader = null; }
-		if (mPipThread != null) { mPipThread.quitSafely(); mPipThread = null; }
+		// PiP cleanup
+		stopPipDecoder();
+		if (mPipDecSurface != null) { try { mPipDecSurface.release(); } catch (Exception ignored) {} mPipDecSurface = null; }
 		if (mVidEnc!=null){try{mVidEnc.stop();mVidEnc.release();}catch(Exception e){} mVidEnc=null;}
 		if (mEncSurface!=null){try{mEncSurface.release();}catch(Exception e){} mEncSurface=null;}
 		try {
@@ -310,17 +309,36 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		svLP.gravity = Gravity.CENTER;
 		root.addView(mSv, svLP);
 
-		// ── EIS PiP monitor — показывает реальный стабилизированный выход ─────
-		// Позиционируем в правом верхнем углу (не перекрывает управление).
-		// GONE пока EIS выключен.
-		mPipView = new ImageView(this);
-		mPipView.setScaleType(ImageView.ScaleType.FIT_CENTER);
+		// ── PiP-монитор: TextureView получает вывод MediaCodec-декодера ───────────
+		// Декодер питается ровно теми же H.264-фреймами, что идут в файл.
+		// GONE пока стабилизация выключена.
+		mPipView = new TextureView(this);
 		mPipView.setVisibility(View.GONE);
 		// Рамка: жёлтая → "это то, что идёт в файл"
 		GradientDrawable pipBorder = new GradientDrawable();
 		pipBorder.setStroke(dp(2), 0xFFFFCC00);
 		pipBorder.setColor(0x00000000);
 		mPipView.setBackground(pipBorder);
+		mPipView.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
+			@Override
+			public void onSurfaceTextureAvailable(android.graphics.SurfaceTexture st, int w, int h) {
+				mPipDecSurface = new Surface(st);
+				// Если формат уже известен (энкодер уже запущен) — инициализируем декодер
+				MediaFormat fmt;
+				synchronized (mVidRingLock) { fmt = mVidOutFmt; }
+				if (fmt != null) ensurePipDecoder(fmt);
+			}
+			@Override
+			public void onSurfaceTextureSizeChanged(android.graphics.SurfaceTexture st, int w, int h) {}
+			@Override
+			public boolean onSurfaceTextureDestroyed(android.graphics.SurfaceTexture st) {
+				stopPipDecoder();
+				if (mPipDecSurface != null) { mPipDecSurface.release(); mPipDecSurface = null; }
+				return true;
+			}
+			@Override
+			public void onSurfaceTextureUpdated(android.graphics.SurfaceTexture st) {}
+		});
 		int pipW = dp(200), pipH = dp(113); // 16:9
 		FrameLayout.LayoutParams pipLP = new FrameLayout.LayoutParams(pipW, pipH);
 		pipLP.gravity = Gravity.TOP | Gravity.RIGHT;
@@ -929,6 +947,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					Rect rect = ch.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
 					if (rect != null)
 					mSensorRect = rect;
+					// PRE_CORRECTION_ACTIVE_ARRAY_SIZE — при EIS=ON камера интерпретирует
+					// SCALER_CROP_REGION в пространстве этого прямоугольника, а не ACTIVE_ARRAY.
+					// Они могут отличаться по смещению и размеру (обычно на несколько пикселей).
+					Rect preCorr = ch.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE);
+					mPreCorrRect = (preCorr != null) ? preCorr : mSensorRect;
 					Float maxZ = ch.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
 					if (maxZ != null)
 					mMaxZoom = maxZ;
@@ -1005,15 +1028,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			targets.add(preview);
 			if (mEncSurface != null && mEncSurface.isValid())
 				targets.add(mEncSurface);
-
-			// ── EIS PiP: добавляем ImageReader как третий таргет ─────────────
-			// Важно: ImageReader добавляется только когда EIS включён — лишний
-			// стрим увеличивает нагрузку на шину ISP и может снизить FPS.
-			// Размер PIP_W×PIP_H (320×180) заведомо меньше RECORD_SIZE → на всех
-			// устройствах попадает в допустимую комбинацию стримов (PRIV+PRIV+YUV).
-			if (mEisEnabled && mEisSupported && mPipReader != null) {
-				targets.add(mPipReader.getSurface());
-			}
+			// PiP-монитор теперь питается от декодера (encoder output → MediaCodec decoder → TextureView).
+			// ImageReader в capture session больше не нужен — session стала проще и легче.
 
 			mCamDev.createCaptureSession(targets, new CameraCaptureSession.StateCallback() {
 				@Override
@@ -1046,10 +1062,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			rb.addTarget(preview);
 			if (mEncSurface != null && mEncSurface.isValid())
 				rb.addTarget(mEncSurface);
-			// PiP reader должен быть таргетом в запросе, иначе кадры не придут
-			if (mEisEnabled && mEisSupported && mPipReader != null) {
-				rb.addTarget(mPipReader.getSurface());
-			}
+			// ImageReader больше не используется в capture session
 			
 			if (mManualFocus) {
 				// Ручной фокус: переводим прогресс (0=∞, 1=macro) в диоптрии
@@ -1075,25 +1088,22 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					: CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF);
 			
 			if (mSensorRect != null) {
-				if (mEisEnabled && mEisSupported) {
-					// ── EIS активен: НЕЛЬЗЯ выставлять суженный SCALER_CROP_REGION ─────
-					// Аппаратный EIS использует запас по краям сенсора для компенсации
-					// движения. Если мы одновременно задаём смещённый кроп (зум),
-					// камера игнорирует cropX/cropY, сохраняя cropW/cropH: кроп идёт
-					// не из центра сенсора, а с угла (0,0) — отсюда несимметричный срез
-					// справа и сверху, пропорциональный зуму.
-					// Решение (по документации Camera2): при активном EIS выставлять
-					// SCALER_CROP_REGION равным полному активному массиву — EIS сам
-					// управляет кропом и выдаёт правильно центрированный стабилизированный
-					// кадр на все выходные поверхности.
-					rb.set(CaptureRequest.SCALER_CROP_REGION, mSensorRect);
-				} else {
-					int cropW = Math.max(1, (int) (mSensorRect.width() / mZoomLevel));
-					int cropH = Math.max(1, (int) (mSensorRect.height() / mZoomLevel));
-					int cropX = mSensorRect.left + (mSensorRect.width() - cropW) / 2;
-					int cropY = mSensorRect.top + (mSensorRect.height() - cropH) / 2;
-					rb.set(CaptureRequest.SCALER_CROP_REGION, new Rect(cropX, cropY, cropX + cropW, cropY + cropH));
-				}
+				// ── SCALER_CROP_REGION и EIS ─────────────────────────────────────────
+				// При CONTROL_VIDEO_STABILIZATION_MODE_ON камера интерпретирует
+				// SCALER_CROP_REGION в пространстве SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE,
+				// а не SENSOR_INFO_ACTIVE_ARRAY_SIZE. Два прямоугольника могут отличаться
+				// по смещению и размеру (обычно 4–16 пикселей по каждой стороне).
+				// Если считать кроп в ACTIVE_ARRAY, а камера читает его как PRE_CORRECTION —
+				// возникает несимметричный сдвиг, пропорциональный зуму: при zoom=1 разница
+				// нулевая, при zoom=4 — уже 25% кадра, что и даёт срез справа/сверху.
+				// Решение: переключаемся на нужное пространство координат.
+				Rect base = (mEisEnabled && mEisSupported && mPreCorrRect != null)
+					? mPreCorrRect : mSensorRect;
+				int cropW = Math.max(1, (int) (base.width()  / mZoomLevel));
+				int cropH = Math.max(1, (int) (base.height() / mZoomLevel));
+				int cropX = base.left + (base.width()  - cropW) / 2;
+				int cropY = base.top  + (base.height() - cropH) / 2;
+				rb.set(CaptureRequest.SCALER_CROP_REGION, new Rect(cropX, cropY, cropX + cropW, cropY + cropH));
 			}
 			sess.setRepeatingRequest(rb.build(), null, mCamHandler);
 			} catch (Exception ignored) {
@@ -1202,7 +1212,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			catch (Exception e) { break; }
 
 			if (out == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-				synchronized(mVidRingLock) { mVidOutFmt = enc.getOutputFormat(); }
+				MediaFormat fmt = enc.getOutputFormat();
+				synchronized(mVidRingLock) { mVidOutFmt = fmt; }
+				// Инициализируем PiP-декодер с новым форматом (содержит SPS/PPS в csd-0/csd-1)
+				if (mEisEnabled && mEisSupported) ensurePipDecoder(fmt);
 				continue;
 			}
 			if (out < 0) continue;
@@ -1212,6 +1225,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				if (cfg || info.size <= 0) continue;
 				ByteBuffer data = enc.getOutputBuffer(out);
 				int mode = mVidWriteMode;
+
+				// ── PiP-декодер: ответвляем фрейм параллельно с muxer/ring ──────────
+				// Копируем до releaseOutputBuffer — после него буфер недействителен.
+				feedToPipDecoder(data, info);
 
 				if (mode == 0) {
 					// ── RING: добавляем в кольцо, обрезаем по mPreBufSecs ──
@@ -2702,130 +2719,123 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		}
 	}
 
-	// =========================================================================
-	// EIS PiP helpers
-	// =========================================================================
+
 
 	/**
-	 * Создаём ImageReader, запускаем фоновый поток конвертации YUV→Bitmap,
-	 * показываем PiP-оверлей, пересоздаём capture session с новой поверхностью.
-	 *
-	 * Порядок важен: сначала создать ImageReader, потом пересоздать сессию —
-	 * иначе в targets окажется null-поверхность.
+	 * Создаёт (или пересоздаёт) MediaCodec AVC-декодер, выводящий на
+	 * Surface TextureView. Запускает дренажный поток pipDecodeLoop.
+	 * Вызывается из videoPreviewLoop (фоновый поток) при INFO_OUTPUT_FORMAT_CHANGED,
+	 * а также из SurfaceTextureListener.onSurfaceTextureAvailable (UI-поток).
+	 */
+	private synchronized void ensurePipDecoder(MediaFormat encoderFmt) {
+		if (mPipDecSurface == null || !mPipDecSurface.isValid()) return;
+		stopPipDecoder(); // освобождаем старый, если был
+		try {
+			mPipDec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
+			mPipDec.configure(encoderFmt, mPipDecSurface, null, 0);
+			mPipDec.start();
+			mPipDecReady = true;
+			mPipDecThread = new Thread(this::pipDecodeLoop, "pip-decode");
+			mPipDecThread.setDaemon(true);
+			mPipDecThread.start();
+		} catch (Exception e) {
+			mPipDecReady = false;
+			if (mPipDec != null) { try { mPipDec.release(); } catch (Exception ignored) {} mPipDec = null; }
+		}
+	}
+
+	/** Останавливает декодер и дренажный поток. Thread-safe. */
+	private synchronized void stopPipDecoder() {
+		mPipDecReady = false;
+		if (mPipDecThread != null) {
+			mPipDecThread.interrupt();
+			try { mPipDecThread.join(300); } catch (Exception ignored) {}
+			mPipDecThread = null;
+		}
+		if (mPipDec != null) {
+			try { mPipDec.stop(); mPipDec.release(); } catch (Exception ignored) {}
+			mPipDec = null;
+		}
+	}
+
+	/**
+	 * Кормит один фрейм в декодер. Вызывается из videoPreviewLoop —
+	 * НЕ блокируется (dequeueInputBuffer с timeout=0).
+	 * ByteBuffer data валиден до releaseOutputBuffer в вызывающем потоке.
+	 */
+	private void feedToPipDecoder(ByteBuffer data, MediaCodec.BufferInfo info) {
+		if (!mPipDecReady || !mEisEnabled) return;
+		MediaCodec dec = mPipDec;
+		if (dec == null) return;
+		try {
+			int idx = dec.dequeueInputBuffer(0); // не блокируем encoder-loop
+			if (idx < 0) return; // декодер занят — пропускаем кадр (некритично)
+			ByteBuffer inBuf = dec.getInputBuffer(idx);
+			inBuf.clear();
+			int size = info.size;
+			byte[] tmp = new byte[size];
+			data.position(info.offset);
+			data.get(tmp, 0, size);
+			inBuf.put(tmp, 0, size);
+			dec.queueInputBuffer(idx, 0, size, info.presentationTimeUs, info.flags);
+		} catch (Exception ignored) {}
+	}
+
+	/**
+	 * Дренирует декодер и рендерит на Surface TextureView.
+	 * Работает на отдельном демон-потоке (pip-decode).
+	 */
+	private void pipDecodeLoop() {
+		MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+		while (!Thread.interrupted() && mPipDecReady) {
+			MediaCodec dec = mPipDec;
+			if (dec == null) break;
+			try {
+				int out = dec.dequeueOutputBuffer(info, 20_000); // 20 мс timeout
+				if (out >= 0) {
+					dec.releaseOutputBuffer(out, true); // true = рендерим на Surface
+				}
+			} catch (Exception e) {
+				break;
+			}
+		}
+	}
+
+	/**
+	 * Показываем PiP: делаем TextureView видимым и запускаем декодер
+	 * (если энкодер уже прогрет — его формат уже в mVidOutFmt).
 	 */
 	private void startEisOverlay() {
-		// Фоновый поток для YUV-конвертации (не блокирует UI и camera-поток)
-		if (mPipThread == null || !mPipThread.isAlive()) {
-			mPipThread = new HandlerThread("eis-pip");
-			mPipThread.start();
-			mPipHandler = new Handler(mPipThread.getLooper());
-		}
-		// ImageReader: YUV_420_888, 320×180, double-buffered
-		if (mPipReader != null) { mPipReader.close(); mPipReader = null; }
-		mPipReader = ImageReader.newInstance(PIP_W, PIP_H,
-				android.graphics.ImageFormat.YUV_420_888, /*maxImages=*/ 2);
-		mPipFrameSkip = 0;
-
-		mPipReader.setOnImageAvailableListener(reader -> {
-			// Пропускаем 2 из 3 кадров → ~10 fps на дисплее
-			mPipFrameSkip++;
-			if (mPipFrameSkip % 3 != 0) {
-				// Обязательно закрываем — иначе буфер переполнится и новые кадры перестанут приходить
-				Image img = reader.acquireLatestImage();
-				if (img != null) img.close();
-				return;
-			}
-			Image img = reader.acquireLatestImage();
-			if (img == null) return;
-			try {
-				Bitmap bmp = yuv420ToBitmap(img);
-				runOnUiThread(() -> {
-					if (mPipView != null) mPipView.setImageBitmap(bmp);
-				});
-			} finally {
-				img.close();
-			}
-		}, mPipHandler);
-
-		// Показываем PiP и подпись
 		runOnUiThread(() -> {
 			if (mPipView != null) mPipView.setVisibility(View.VISIBLE);
-			// Находим подпись по тегу
-			View root = mPipView.getRootView();
-			View lbl = root.findViewWithTag("pip_label");
-			if (lbl != null) lbl.setVisibility(View.VISIBLE);
+			View root = mPipView != null ? mPipView.getRootView() : null;
+			if (root != null) {
+				View lbl = root.findViewWithTag("pip_label");
+				if (lbl != null) lbl.setVisibility(View.VISIBLE);
+			}
 		});
-
-		// Пересоздаём capture session — теперь с ImageReader в targets
+		// Если Surface TextureView уже готов и формат известен — стартуем декодер
+		MediaFormat fmt;
+		synchronized (mVidRingLock) { fmt = mVidOutFmt; }
+		if (mPipDecSurface != null && fmt != null) ensurePipDecoder(fmt);
+		// Пересоздаём capture session (теперь без ImageReader — стало проще)
 		if (mCamHandler != null) mCamHandler.post(this::startPreview);
 	}
 
 	/**
-	 * Скрываем PiP, освобождаем ImageReader, пересоздаём сессию без него.
+	 * Скрываем PiP и освобождаем декодер.
 	 */
 	private void stopEisOverlay() {
 		runOnUiThread(() -> {
-			if (mPipView != null) {
-				mPipView.setVisibility(View.GONE);
-				mPipView.setImageBitmap(null);
-			}
+			if (mPipView != null) mPipView.setVisibility(View.GONE);
 			View root = mPipView != null ? mPipView.getRootView() : null;
 			if (root != null) {
 				View lbl = root.findViewWithTag("pip_label");
 				if (lbl != null) lbl.setVisibility(View.GONE);
 			}
 		});
-		if (mPipReader != null) {
-			mPipReader.setOnImageAvailableListener(null, null);
-			mPipReader.close();
-			mPipReader = null;
-		}
-		if (mPipThread != null) {
-			mPipThread.quitSafely();
-			mPipThread = null;
-			mPipHandler = null;
-		}
-		// Пересоздаём сессию без ImageReader
+		stopPipDecoder();
 		if (mCamHandler != null) mCamHandler.post(this::startPreview);
-	}
-
-	/**
-	 * Конвертация YUV_420_888 → ARGB_8888 Bitmap.
-	 *
-	 * YUV_420_888 — полу-планарный или планарный формат.
-	 * Используем planes[0] (Y), planes[1] (U/Cb), planes[2] (V/Cr).
-	 * Формула BT.601 (стандарт для видео с камеры).
-	 *
-	 * Работает на фоновом потоке — не блокирует UI.
-	 */
-	private static Bitmap yuv420ToBitmap(Image image) {
-		Image.Plane[] p = image.getPlanes();
-		ByteBuffer yBuf = p[0].getBuffer();
-		ByteBuffer uBuf = p[1].getBuffer();
-		ByteBuffer vBuf = p[2].getBuffer();
-		int yRowStride  = p[0].getRowStride();
-		int uvRowStride = p[1].getRowStride();
-		int uvPixStride = p[1].getPixelStride(); // 1 (планарный) или 2 (полупланарный NV12/NV21)
-		int w = image.getWidth(), h = image.getHeight();
-		int[] argb = new int[w * h];
-		for (int row = 0; row < h; row++) {
-			for (int col = 0; col < w; col++) {
-				int yIdx  = row * yRowStride + col;
-				int uvIdx = (row >> 1) * uvRowStride + (col >> 1) * uvPixStride;
-				int Y = (yBuf.get(yIdx)         & 0xFF) - 16;
-				int U = (uBuf.get(uvIdx)         & 0xFF) - 128;
-				int V = (vBuf.get(uvIdx)         & 0xFF) - 128;
-				// BT.601 full-range
-				int r = (298 * Y           + 409 * V + 128) >> 8;
-				int g = (298 * Y - 100 * U - 208 * V + 128) >> 8;
-				int b = (298 * Y + 516 * U           + 128) >> 8;
-				argb[row * w + col] = 0xFF000000
-					| (Math.max(0, Math.min(255, r)) << 16)
-					| (Math.max(0, Math.min(255, g)) <<  8)
-					|  Math.max(0, Math.min(255, b));
-			}
-		}
-		return Bitmap.createBitmap(argb, w, h, Bitmap.Config.ARGB_8888);
 	}
 
 }
