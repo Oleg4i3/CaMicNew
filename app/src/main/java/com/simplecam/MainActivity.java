@@ -311,8 +311,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
 		// PiP-монитор: SurfaceView поверх превью, декодер кормит его H.264-фреймами энкодера
 		mPipView = new SurfaceView(this);
-		mPipView.setZOrderOnTop(true);          // рисуется поверх основного SurfaceView
-		mPipView.getHolder().setFormat(android.graphics.PixelFormat.TRANSLUCENT);
+		// setZOrderMediaOverlay: рисуется поверх mSv (дрожащая рамка видна по краям),
+		// но ПОД обычными View — все контролы, кнопки и слайдеры остаются поверх превью.
+		mPipView.setZOrderMediaOverlay(true);
 		mPipView.setVisibility(View.GONE);
 		mPipView.getHolder().addCallback(new SurfaceHolder.Callback() {
 			@Override public void surfaceCreated(SurfaceHolder h) {
@@ -328,29 +329,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			}
 		});
 		GradientDrawable pipBorder = new GradientDrawable();
-		pipBorder.setStroke(dp(2), 0xFFFFCC00);
+		pipBorder.setStroke(dp(2), 0x88FFCC00);
 		pipBorder.setColor(0x00000000);
 		mPipView.setBackground(pipBorder);
-		int pipW = dp(200), pipH = dp(113); // 16:9
-		FrameLayout.LayoutParams pipLP = new FrameLayout.LayoutParams(pipW, pipH);
-		pipLP.gravity = Gravity.TOP | Gravity.RIGHT;
-		pipLP.topMargin  = dp(6);
-		pipLP.rightMargin = dp(60); // не перекрывать зум-рычаг
+		// Почти на весь экран; отступ dp(40) по краям — видна "дрожащая рамка" из mSv
+		FrameLayout.LayoutParams pipLP = new FrameLayout.LayoutParams(
+			ViewGroup.LayoutParams.MATCH_PARENT,
+			ViewGroup.LayoutParams.MATCH_PARENT);
+		pipLP.setMargins(dp(40), dp(40), dp(40), dp(40));
 		root.addView(mPipView, pipLP);
 
-		// Подпись над PiP
-		TextView tvPipLabel = new TextView(this);
-		tvPipLabel.setText("▶ EIS out");
-		tvPipLabel.setTextColor(0xFFFFCC00);
-		tvPipLabel.setTextSize(10);
-		tvPipLabel.setTag("pip_label");
-		tvPipLabel.setVisibility(View.GONE);
-		FrameLayout.LayoutParams lblLP = new FrameLayout.LayoutParams(
-			ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-		lblLP.gravity = Gravity.TOP | Gravity.RIGHT;
-		lblLP.topMargin  = dp(2);
-		lblLP.rightMargin = dp(60);
-		root.addView(tvPipLabel, lblLP);
+
 
 		// ── Осциллограф — прозрачный оверлей, верхняя часть кадра ─────────
 		mOscilloscope = new OscilloscopeView(this);
@@ -2764,11 +2753,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private void startEisOverlay() {
 		runOnUiThread(() -> {
 			if (mPipView != null) mPipView.setVisibility(View.VISIBLE);
-			View root = mPipView != null ? mPipView.getRootView() : null;
-			if (root != null) {
-				View lbl = root.findViewWithTag("pip_label");
-				if (lbl != null) lbl.setVisibility(View.VISIBLE);
-			}
 		});
 		// Декодер стартует из SurfaceHolder.Callback.surfaceCreated когда surface готов.
 		// Если surface уже существует (видимость менялась раньше) — стартуем сразу.
@@ -2784,11 +2768,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		stopPipDecoder();
 		runOnUiThread(() -> {
 			if (mPipView != null) mPipView.setVisibility(View.GONE);
-			View root = mPipView != null ? mPipView.getRootView() : null;
-			if (root != null) {
-				View lbl = root.findViewWithTag("pip_label");
-				if (lbl != null) lbl.setVisibility(View.GONE);
-			}
 		});
 		if (mCamHandler != null) mCamHandler.post(this::startPreview);
 	}
