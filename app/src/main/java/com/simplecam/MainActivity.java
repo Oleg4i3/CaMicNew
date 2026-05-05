@@ -28,11 +28,13 @@ import android.media.audiofx.AutomaticGainControl;
 import android.media.audiofx.NoiseSuppressor;
 import android.media.audiofx.AcousticEchoCanceler;
 
+import android.media.Image;
+import android.media.ImageReader;
+
 import java.io.File;
 import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -97,6 +99,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private boolean mPermsOk;
 	private int mSensorOrientation = 90;
 	private Rect mSensorRect;
+	// PRE_CORRECTION_ACTIVE_ARRAY_SIZE — координатное пространство при EIS=ON
+	private Rect mPreCorrRect;
 	private float mMaxZoom = 1f;
 	private volatile float mZoomLevel = 1f;
 	private volatile float mZoomLeverPos = 0f;
@@ -112,22 +116,24 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	/** true — железо поддерживает VIDEO_STABILIZATION_MODE_ON */
 	private volatile boolean mEisSupported = false;
 
-	// ─── EIS PiP: маленький SurfaceView, декодирует выход энкодера ──────────────
-	// Архитектура: videoPreviewLoop копирует каждый кадр в mPipQueue
-	// (не трогая mVidRing и не беря synchronized(this)).
-	// Отдельный поток pip-dec читает из очереди, кормит MediaCodec decoder,
-	// тот рендерит в маленький SurfaceView. Задержка ≈ 1-3 кадра (encoder lag).
-	private SurfaceView    mPipSv;
-	private volatile boolean mPipSvReady   = false;
-	private Thread         mPipDecThread;
-	private volatile boolean mPipDecRunning = false;
-	// Очередь: ограничена 90 кадрами (~3 с при 30 fps).
-	// Если pip-dec не успевает — offer() возвращает false, старый кадр не теряется,
-	// просто новый не добавляется; это нормально для мониторинга.
-	private final LinkedBlockingQueue<EncodedFrame> mPipQueue =
-		new LinkedBlockingQueue<>(90);
-	// Формат от энкодера (содержит CSD: SPS+PPS) — нужен для configure() декодера
-	private volatile MediaFormat mPipEncFmt = null;
+	// ─── EIS PiP monitor (ImageReader) ────────────────────────────────────────
+	/**
+	 * Реальный монитор EIS: третья поверхность в capture session.
+	 * Получает тот же стабилизированный стрим, что идёт в энкодер.
+	 *
+	 * Почему именно ImageReader, а не гироскоп:
+	 *   HW EIS использует кросс-корреляцию кадров внутри ISP/DSP — алгоритм
+	 *   не привязан напрямую к гироскопу и может давать систематические
+	 *   смещения (например, в нижний левый угол), которые гироскоп не покажет.
+	 *   ImageReader получает кадр ПОСЛЕ стабилизатора — это и есть реальный
+	 *   выход в файл.
+	 */
+	// PiP: live-декодер encoder→SurfaceView (SurfaceView не требует hardware acceleration)
+	private SurfaceView  mPipView;
+	private Surface      mPipDecSurface;
+	private MediaCodec   mPipDec;
+	private Thread       mPipDecThread;
+	private volatile boolean mPipDecReady = false;
 	
 	// ─── Запись ───────────────────────────────────────────────────────────────
 	private volatile boolean mRecording;
@@ -230,31 +236,30 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		checkPerms();
 	}
 	
-	private volatile boolean mDestroyed = false;
-
 	@Override
 	protected void onResume() {
 		super.onResume();
-		if (mEisEnabled && mEisSupported) startPipDecoder();
+		// Перезапускаем PiP только если EIS был включён до паузы
+		if (mEisEnabled && mEisSupported) startEisOverlay();
 	}
 
 	@Override
 	protected void onPause() {
 		super.onPause();
 		if (mRecording) mRecording = false;
-		stopPipDecoder();
+		stopEisOverlay(); // освобождаем ImageReader и PiP поток
 	}
 	
 	@Override
 	protected void onDestroy() {
 		super.onDestroy();
-		mDestroyed = true;
-		stopPipDecoder(); // до закрытия энкодера — иначе pip-dec читает мёртвый формат
 		if (mCamHandler != null)
 			mCamHandler.removeCallbacks(mZoomRunnable);
 		mVidLoopRunning = false;
 		stopAudio();
 		finalizeMuxer();
+		// PiP cleanup
+		stopPipDecoder();
 		if (mVidEnc!=null){try{mVidEnc.stop();mVidEnc.release();}catch(Exception e){} mVidEnc=null;}
 		if (mEncSurface!=null){try{mEncSurface.release();}catch(Exception e){} mEncSurface=null;}
 		try {
@@ -298,37 +303,54 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				}
 			}
 		};
-		// Размер буфера SurfaceView = размеру энкодера, ДО surfaceCreated.
-		// Если ставить setFixedSize в surfaceCreated — вызывает surfaceDestroyed
-		// → surfaceCreated повторно → openCamera() дважды → краш при старте.
-		// При одинаковом размере превью и энкодера HAL строит единый EIS-пайплайн
-		// и кроп симметрично центрирован. Визуально SurfaceView масштабирует
-		// буфер до размеров экрана аппаратно — качество не страдает.
-		mSv.getHolder().setFixedSize(VIDEO_W, VIDEO_H);
 		mSv.getHolder().addCallback(this);
 		FrameLayout.LayoutParams svLP = new FrameLayout.LayoutParams(
 			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
 		svLP.gravity = Gravity.CENTER;
 		root.addView(mSv, svLP);
 
-		// ── EIS PiP: маленький SurfaceView, показывает реальный выход стабилизатора
-		mPipSv = new SurfaceView(this);
-		mPipSv.setVisibility(View.GONE);
-		mPipSv.getHolder().addCallback(new SurfaceHolder.Callback() {
-			@Override public void surfaceCreated(SurfaceHolder h)               { mPipSvReady = true; }
-			@Override public void surfaceChanged(SurfaceHolder h,int f,int w,int t) {}
-			@Override public void surfaceDestroyed(SurfaceHolder h)             { mPipSvReady = false; }
+		// PiP-монитор: SurfaceView поверх превью, декодер кормит его H.264-фреймами энкодера
+		mPipView = new SurfaceView(this);
+		mPipView.setZOrderOnTop(true);          // рисуется поверх основного SurfaceView
+		mPipView.getHolder().setFormat(android.graphics.PixelFormat.TRANSLUCENT);
+		mPipView.setVisibility(View.GONE);
+		mPipView.getHolder().addCallback(new SurfaceHolder.Callback() {
+			@Override public void surfaceCreated(SurfaceHolder h) {
+				mPipDecSurface = h.getSurface();
+				MediaFormat fmt;
+				synchronized (mVidRingLock) { fmt = mVidOutFmt; }
+				if (fmt != null) ensurePipDecoder(fmt);
+			}
+			@Override public void surfaceChanged(SurfaceHolder h, int fmt, int w, int hh) {}
+			@Override public void surfaceDestroyed(SurfaceHolder h) {
+				stopPipDecoder();
+				mPipDecSurface = null;
+			}
 		});
-		// Рамка: жёлтая = "это то, что пишется в файл"
 		GradientDrawable pipBorder = new GradientDrawable();
 		pipBorder.setStroke(dp(2), 0xFFFFCC00);
-		pipBorder.setColor(0xFF000000);
-		mPipSv.setBackground(pipBorder);
-		FrameLayout.LayoutParams pipLP = new FrameLayout.LayoutParams(dp(200), dp(113)); // 16:9
-		pipLP.gravity    = Gravity.TOP | Gravity.RIGHT;
+		pipBorder.setColor(0x00000000);
+		mPipView.setBackground(pipBorder);
+		int pipW = dp(200), pipH = dp(113); // 16:9
+		FrameLayout.LayoutParams pipLP = new FrameLayout.LayoutParams(pipW, pipH);
+		pipLP.gravity = Gravity.TOP | Gravity.RIGHT;
 		pipLP.topMargin  = dp(6);
 		pipLP.rightMargin = dp(60); // не перекрывать зум-рычаг
-		root.addView(mPipSv, pipLP);
+		root.addView(mPipView, pipLP);
+
+		// Подпись над PiP
+		TextView tvPipLabel = new TextView(this);
+		tvPipLabel.setText("▶ EIS out");
+		tvPipLabel.setTextColor(0xFFFFCC00);
+		tvPipLabel.setTextSize(10);
+		tvPipLabel.setTag("pip_label");
+		tvPipLabel.setVisibility(View.GONE);
+		FrameLayout.LayoutParams lblLP = new FrameLayout.LayoutParams(
+			ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+		lblLP.gravity = Gravity.TOP | Gravity.RIGHT;
+		lblLP.topMargin  = dp(2);
+		lblLP.rightMargin = dp(60);
+		root.addView(tvPipLabel, lblLP);
 
 		// ── Осциллограф — прозрачный оверлей, верхняя часть кадра ─────────
 		mOscilloscope = new OscilloscopeView(this);
@@ -544,14 +566,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mCbEis.setTextSize(12);
 		mCbEis.setEnabled(false); // разблокируется после openCamera, если устройство поддерживает
 		mCbEis.setOnCheckedChangeListener((cb, checked) -> {
+			// Запрещаем переключение во время записи — стабилизатор сбросился бы,
+			// вызвав визуальный артефакт и возможную рассинхронизацию PTS в пре-буфере.
 			if (mRecording) {
 				cb.setChecked(!checked);
 				status("EIS нельзя изменить во время записи");
 				return;
 			}
 			mEisEnabled = checked;
-			if (checked) startPipDecoder();
-			else          stopPipDecoder();
+			if (checked) {
+				startEisOverlay();
+			} else {
+				stopEisOverlay();
+			}
 			if (mCamHandler != null)
 				mCamHandler.post(MainActivity.this::buildAndSendRequest);
 		});
@@ -875,7 +902,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	@Override
 	public void surfaceCreated(SurfaceHolder h) {
 		mSurfaceReady = true;
-		if (mPermsOk) openCamera();
+		if (mPermsOk)
+		openCamera();
 	}
 	
 	@Override
@@ -909,8 +937,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					if (so != null)
 					mSensorOrientation = so;
 					Rect rect = ch.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
-					if (rect != null)
-					mSensorRect = rect;
+					if (rect != null) mSensorRect = rect;
+					Rect preCorr = ch.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE);
+					mPreCorrRect = (preCorr != null) ? preCorr : mSensorRect;
 					Float maxZ = ch.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
 					if (maxZ != null)
 					mMaxZoom = maxZ;
@@ -987,7 +1016,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			targets.add(preview);
 			if (mEncSurface != null && mEncSurface.isValid())
 				targets.add(mEncSurface);
-			// ImageReader убран: PiP декодирует из выхода энкодера, а не из camera session
+			// PiP питается от decoder-а, не от capture session
 
 			mCamDev.createCaptureSession(targets, new CameraCaptureSession.StateCallback() {
 				@Override
@@ -1011,24 +1040,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		if (sess == null || dev == null || !mSurfaceReady)
 		return;
 		try {
-			// TEMPLATE_PREVIEW  — по умолчанию: AE не пересчитывается, нет прыжка яркости.
-			// TEMPLATE_RECORD   — когда включён EIS: ISP строит EIS-пайплайн
-			//   относительно видео-поверхности (encoder surface), а не превью.
-			//   Без этого стабилизатор отображает кроп в координатах SurfaceView
-			//   и encoder surface получает неправильно смещённый кадр — обрезание
-			//   ~30% справа и сверху. TEMPLATE_RECORD устраняет это: камера знает,
-			//   что главный выход — видео, и правильно масштабирует EIS-окно.
-			//   Прыжка яркости нет, т.к. сессия уже прогрета и AE сходится.
-			int tmpl = (mEisEnabled && mEisSupported)
-					? CameraDevice.TEMPLATE_RECORD
-					: CameraDevice.TEMPLATE_PREVIEW;
+			// Всегда TEMPLATE_PREVIEW — шаблон не переключается при старте записи,
+			// поэтому AE не пересчитывается и яркость не прыгает.
+			// Encoder surface просто добавляется как дополнительный target.
+			int tmpl = CameraDevice.TEMPLATE_PREVIEW;
 			Surface preview = mSv.getHolder().getSurface();
 			CaptureRequest.Builder rb = dev.createCaptureRequest(tmpl);
 			rb.addTarget(preview);
 			if (mEncSurface != null && mEncSurface.isValid())
 				rb.addTarget(mEncSurface);
-			// ImageReader убран из сессии — PiP читает из энкодера
-
+			
 			if (mManualFocus) {
 				// Ручной фокус: переводим прогресс (0=∞, 1=macro) в диоптрии
 				// Верх слайдера = прогресс 100 = macro (mMinFocusDist)
@@ -1052,20 +1073,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					? CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
 					: CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF);
 			
-			// ── Зум через SCALER_CROP_REGION ──────────────────────────────────────
-			// КРИТИЧНО для EIS: при zoom=1.0 НЕ устанавливаем SCALER_CROP_REGION.
-			// На многих HAL явная установка full-sensor rect + VIDEO_STABILIZATION_MODE_ON
-			// смещает якорь стабилизатора в corner (0,0) вместо центра сенсора.
-			// Результат: EIS crop несимметрично обрезает кадр (30-40% справа и сверху).
-			// Без явного SCALER_CROP_REGION HAL использует центрированный default.
-			// При zoom>1.0 задаём crop явно — стабилизатор работает внутри него.
-			if (mSensorRect != null && mZoomLevel > 1.0f) {
-				int cropW = Math.max(1, (int)(mSensorRect.width()  / mZoomLevel));
-				int cropH = Math.max(1, (int)(mSensorRect.height() / mZoomLevel));
-				int cropX = mSensorRect.left + (mSensorRect.width()  - cropW) / 2;
-				int cropY = mSensorRect.top  + (mSensorRect.height() - cropH) / 2;
-				rb.set(CaptureRequest.SCALER_CROP_REGION,
-					new Rect(cropX, cropY, cropX + cropW, cropY + cropH));
+			if (mSensorRect != null) {
+				// При EIS=ON камера интерпретирует SCALER_CROP_REGION в пространстве
+				// PRE_CORRECTION_ACTIVE_ARRAY_SIZE, а не ACTIVE_ARRAY_SIZE.
+				// Используем правильный базовый прямоугольник:
+				Rect base = (mEisEnabled && mEisSupported && mPreCorrRect != null)
+						? mPreCorrRect : mSensorRect;
+				int cropW = Math.max(1, (int) (base.width()  / mZoomLevel));
+				int cropH = Math.max(1, (int) (base.height() / mZoomLevel));
+				int cropX = base.left + (base.width()  - cropW) / 2;
+				int cropY = base.top  + (base.height() - cropH) / 2;
+				rb.set(CaptureRequest.SCALER_CROP_REGION, new Rect(cropX, cropY, cropX + cropW, cropY + cropH));
 			}
 			sess.setRepeatingRequest(rb.build(), null, mCamHandler);
 			} catch (Exception ignored) {
@@ -1176,7 +1194,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			if (out == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
 				MediaFormat fmt = enc.getOutputFormat();
 				synchronized(mVidRingLock) { mVidOutFmt = fmt; }
-				mPipEncFmt = fmt; // для configure() PiP декодера
+				if (mEisEnabled && mEisSupported) ensurePipDecoder(fmt);
 				continue;
 			}
 			if (out < 0) continue;
@@ -1185,11 +1203,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				boolean cfg = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
 				if (cfg || info.size <= 0) continue;
 				ByteBuffer data = enc.getOutputBuffer(out);
-
 				int mode = mVidWriteMode;
+				// PiP: ответвляем фрейм в декодер ДО releaseOutputBuffer
+				feedToPipDecoder(data, info);
 
 				if (mode == 0) {
 					// ── RING: добавляем в кольцо, обрезаем по mPreBufSecs ──
+					// При активном EIS добавляем EIS_LATENCY_US: стабилизатор буферизует
+					// кадры внутри камеры, и реальная глубина пре-записи должна быть
+					// шире на эту задержку, чтобы пре-буфер не потерял начало.
 					EncodedFrame f = new EncodedFrame(data, info);
 					synchronized(mVidRingLock) {
 						mVidRing.addLast(f);
@@ -1200,9 +1222,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 							mVidRing.removeFirst();
 						}
 					}
-					// Отправляем копию в PiP — offer() не блокирует; если очередь
-					// полна (pip-dec отстаёт) — просто пропускаем кадр.
-					if (mPipDecRunning) mPipQueue.offer(f);
 				} else if (mode == 1) {
 					// ── FLUSH: сбрасываем кольцо в мюксер, затем текущий кадр ──
 					// Всё делаем здесь — атомарно, в одном потоке.
@@ -1229,7 +1248,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					MediaCodec.BufferInfo n = new MediaCodec.BufferInfo();
 					n.set(info.offset, info.size, info.presentationTimeUs - mMuxBasePts, info.flags);
 					synchronized(mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mVidTrack, data, n); }
-					if (mPipDecRunning) mPipQueue.offer(new EncodedFrame(data, info));
 				}
 			} finally { enc.releaseOutputBuffer(out, false); }
 		}
@@ -2679,109 +2697,100 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	}
 
 	// =========================================================================
-	// EIS PiP — декодер из выхода энкодера
+	// =========================================================================
+	// PiP decoder: encoder output → MediaCodec AVC decoder → SurfaceView
 	// =========================================================================
 
-	/**
-	 * Запускает pip-dec поток и показывает мини-превью.
-	 * Безопасно вызывать несколько раз подряд — idempotent.
-	 */
-	private void startPipDecoder() {
-		if (mPipDecRunning) return;
-		mPipQueue.clear();
-		mPipDecRunning = true;
-		runOnUiThread(() -> { if (mPipSv != null) mPipSv.setVisibility(View.VISIBLE); });
-		mPipDecThread = new Thread(this::pipDecLoop, "pip-dec");
-		mPipDecThread.setDaemon(true);
-		mPipDecThread.start();
+	private synchronized void ensurePipDecoder(MediaFormat fmt) {
+		if (mPipDecSurface == null) return;
+		stopPipDecoder();
+		try {
+			mPipDec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
+			mPipDec.configure(fmt, mPipDecSurface, null, 0);
+			mPipDec.start();
+			mPipDecReady = true;
+			mPipDecThread = new Thread(this::pipDecodeLoop, "pip-dec");
+			mPipDecThread.setDaemon(true);
+			mPipDecThread.start();
+		} catch (Exception e) {
+			mPipDecReady = false;
+			if (mPipDec != null) { try { mPipDec.release(); } catch (Exception ignored) {} mPipDec = null; }
+		}
 	}
 
-	/**
-	 * Останавливает pip-dec поток и скрывает мини-превью.
-	 * Безопасно вызывать несколько раз и из любого потока.
-	 */
-	private void stopPipDecoder() {
-		if (!mPipDecRunning) return;
-		mPipDecRunning = false;
-		// Будим поток, если он висит в poll()
-		mPipQueue.offer(new EncodedFrame(ByteBuffer.allocate(0),
-			new MediaCodec.BufferInfo())); // пустой sentinel
+	private synchronized void stopPipDecoder() {
+		mPipDecReady = false;
 		if (mPipDecThread != null) {
-			try { mPipDecThread.join(500); } catch (InterruptedException ignored) {}
+			mPipDecThread.interrupt();
+			try { mPipDecThread.join(400); } catch (Exception ignored) {}
 			mPipDecThread = null;
 		}
-		mPipQueue.clear();
-		runOnUiThread(() -> { if (mPipSv != null) mPipSv.setVisibility(View.GONE); });
+		if (mPipDec != null) {
+			try { mPipDec.stop(); mPipDec.release(); } catch (Exception ignored) {}
+			mPipDec = null;
+		}
 	}
 
-	/**
-	 * Главный цикл pip-dec потока.
-	 *
-	 * Алгоритм:
-	 *  1. Ждём пока SurfaceHolder и mPipEncFmt будут готовы.
-	 *  2. Конфигурируем MediaCodec-декодер с поверхностью PiP SurfaceView.
-	 *  3. В цикле: берём кадр из очереди → queueInputBuffer → dequeueOutputBuffer
-	 *     с render=true → декодер сам рисует на поверхность.
-	 *  4. При остановке (mPipDecRunning=false) — нормальное завершение.
-	 *
-	 * Нет shared locks с основным пайплайном. EncodedFrame — immutable byte[].
-	 */
-	private void pipDecLoop() {
-		// Шаг 1: ждём формат и Surface (максимум 5 с)
-		MediaFormat fmt = null;
-		for (int i = 0; i < 100 && mPipDecRunning; i++) {
-			fmt = mPipEncFmt;
-			if (fmt != null && mPipSvReady) break;
-			try { Thread.sleep(50); } catch (InterruptedException e) { return; }
-		}
-		if (fmt == null || !mPipSvReady || !mPipDecRunning) return;
-
-		MediaCodec dec = null;
+	/** Неблокирующая подача фрейма в PiP-декодер. Вызов из videoPreviewLoop. */
+	private void feedToPipDecoder(ByteBuffer data, MediaCodec.BufferInfo info) {
+		if (!mPipDecReady || !mEisEnabled) return;
+		MediaCodec dec = mPipDec;
+		if (dec == null) return;
 		try {
-			Surface outSurface = mPipSv.getHolder().getSurface();
-			dec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
-			dec.configure(fmt, outSurface, null, 0);
-			dec.start();
+			int idx = dec.dequeueInputBuffer(0);
+			if (idx < 0) return; // занят — пропускаем кадр
+			ByteBuffer inBuf = dec.getInputBuffer(idx);
+			inBuf.clear();
+			byte[] tmp = new byte[info.size];
+			data.position(info.offset);
+			data.get(tmp, 0, info.size);
+			inBuf.put(tmp, 0, info.size);
+			dec.queueInputBuffer(idx, 0, info.size, info.presentationTimeUs, info.flags);
+		} catch (Exception ignored) {}
+	}
 
-			MediaCodec.BufferInfo outInfo = new MediaCodec.BufferInfo();
-			boolean inputDone = false;
-
-			while (mPipDecRunning) {
-				// ── Input: берём кадр из очереди ─────────────────────────────
-				if (!inputDone) {
-					EncodedFrame frame = mPipQueue.poll(30, TimeUnit.MILLISECONDS);
-					if (frame != null && frame.data.length > 0) {
-						int idx = dec.dequeueInputBuffer(0);
-						if (idx >= 0) {
-							ByteBuffer inBuf = dec.getInputBuffer(idx);
-							if (inBuf != null) {
-								inBuf.clear();
-								inBuf.put(frame.data);
-								dec.queueInputBuffer(idx, 0, frame.data.length,
-									frame.pts, frame.flags & ~MediaCodec.BUFFER_FLAG_CODEC_CONFIG);
-							}
-							// inBuf == null: просто не используем слот, он вернётся сам
-						}
-						// Если idx < 0 — декодер занят, кадр теряем (нормально для PiP)
-					}
-				}
-
-				// ── Output: рендерим готовые кадры ────────────────────────────
-				int outIdx = dec.dequeueOutputBuffer(outInfo, 0);
-				while (outIdx >= 0) {
-					dec.releaseOutputBuffer(outIdx, /*render=*/true);
-					outIdx = dec.dequeueOutputBuffer(outInfo, 0);
-				}
-				// INFO_OUTPUT_FORMAT_CHANGED / INFO_TRY_AGAIN_LATER — игнорируем
-			}
-		} catch (Exception e) {
-			// Тихо завершаем — это некритичный монитор
-		} finally {
-			if (dec != null) {
-				try { dec.stop(); }    catch (Exception ignored) {}
-				try { dec.release(); } catch (Exception ignored) {}
-			}
+	private void pipDecodeLoop() {
+		MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+		while (!Thread.interrupted() && mPipDecReady) {
+			MediaCodec dec = mPipDec;
+			if (dec == null) break;
+			try {
+				int out = dec.dequeueOutputBuffer(info, 20_000);
+				if (out >= 0) dec.releaseOutputBuffer(out, true);
+			} catch (Exception e) { break; }
 		}
+	}
+
+	private void startEisOverlay() {
+		runOnUiThread(() -> {
+			if (mPipView != null) mPipView.setVisibility(View.VISIBLE);
+			View root = mPipView != null ? mPipView.getRootView() : null;
+			if (root != null) {
+				View lbl = root.findViewWithTag("pip_label");
+				if (lbl != null) lbl.setVisibility(View.VISIBLE);
+			}
+		});
+		// Декодер стартует из SurfaceHolder.Callback.surfaceCreated когда surface готов.
+		// Если surface уже существует (видимость менялась раньше) — стартуем сразу.
+		if (mPipDecSurface != null) {
+			MediaFormat fmt;
+			synchronized (mVidRingLock) { fmt = mVidOutFmt; }
+			if (fmt != null) ensurePipDecoder(fmt);
+		}
+		if (mCamHandler != null) mCamHandler.post(this::startPreview);
+	}
+
+	private void stopEisOverlay() {
+		stopPipDecoder();
+		runOnUiThread(() -> {
+			if (mPipView != null) mPipView.setVisibility(View.GONE);
+			View root = mPipView != null ? mPipView.getRootView() : null;
+			if (root != null) {
+				View lbl = root.findViewWithTag("pip_label");
+				if (lbl != null) lbl.setVisibility(View.GONE);
+			}
+		});
+		if (mCamHandler != null) mCamHandler.post(this::startPreview);
 	}
 
 }
