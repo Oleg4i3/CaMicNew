@@ -5,42 +5,25 @@
     android:viewportWidth="108"
     android:viewportHeight="108">
 
+    <!-- Ножка/база микрофона -->
     <path
-        android:fillColor="#080808"
-        android:pathData="M 0 0 H 108 V 108 H 0 Z" />
-
-    <path
-        android:strokeColor="#4D00FFFF"
-        android:strokeWidth="12"
-        android:strokeLineCap="round"
-        android:strokeLineJoin="round"
-        android:pathData="M 31 31 L 24 31 L 24 55 C 24 72 37 84 54 84 C 71 84 84 72 84 55 L 84 31 L 77 31" />
-        
-    <path
-        android:strokeColor="#4D39FF14"
-        android:strokeWidth="10"
-        android:pathData="M 64 32 A 18 18 0 1 1 64 68 A 18 18 0 1 1 64 32" />
-    <path
-        android:strokeColor="#4D39FF14"
-        android:strokeWidth="10"
-        android:strokeLineCap="round"
-        android:pathData="M 36 50 L 58 50 M 70 50 L 92 50 M 64 22 L 64 44 M 64 56 L 64 78" />
-
-    <path
-        android:fillColor="#00FFFF"
+        android:fillColor="#212B36"
         android:pathData="M 49 84 L 49 95 C 49 97 59 97 59 95 L 59 84 Z" />
 
+    <!-- U-образная стойка (дуга) -->
     <path
-        android:strokeColor="#00FFFF"
-        android:strokeWidth="3.5"
+        android:strokeColor="#212B36"
+        android:strokeWidth="6"
         android:strokeLineCap="round"
         android:strokeLineJoin="round"
         android:pathData="M 31 31 L 24 31 L 24 55 C 24 72 37 84 54 84 C 71 84 84 72 84 55 L 84 31 L 77 31" />
 
+    <!-- Шарниры крепления к корпусу -->
     <path
-        android:fillColor="#00FFFF"
+        android:fillColor="#212B36"
         android:pathData="M 31 27 A 4 4 0 1 1 31 35 A 4 4 0 1 1 31 27 M 77 27 A 4 4 0 1 1 77 35 A 4 4 0 1 1 77 27" />
 
+    <!-- Корпус микрофона с линейным градиентом -->
     <path
         android:pathData="M 35 29 L 35 46 C 35 56.5 43.5 65 54 65 C 64.5 65 73 56.5 73 46 L 73 29 C 73 18.5 64.5 10 54 10 C 43.5 10 35 18.5 35 29 Z">
         <aapt:attr name="android:fillColor">
@@ -50,35 +33,42 @@
                 android:endX="54"
                 android:endY="65"
                 android:type="linear">
-                <item android:offset="0" android:color="#00FFFF"/> <item android:offset="1" android:color="#0033CC"/> </gradient>
+                <item android:offset="0" android:color="#7A8A96"/>
+                <item android:offset="1" android:color="#33404C"/>
+            </gradient>
         </aapt:attr>
     </path>
 
+    <!-- Верхние вертикальные прорези -->
     <path
-        android:strokeColor="#000A24"
+        android:strokeColor="#212B36"
         android:strokeWidth="4"
         android:strokeLineCap="round"
         android:pathData="M 46 16 L 46 22 M 54 16 L 54 22 M 62 16 L 62 22" />
 
+    <!-- Горизонтальные прорези -->
     <path
-        android:strokeColor="#000A24"
+        android:strokeColor="#212B36"
         android:strokeWidth="4.5"
         android:strokeLineCap="round"
         android:pathData="M 41 31 L 67 31 M 41 38 L 67 38 M 41 45 L 67 45 M 41 52 L 67 52" />
 
+    <!-- Зеленое кольцо прицела -->
     <path
-        android:strokeColor="#39FF14"
+        android:strokeColor="#32D74B"
         android:strokeWidth="3.5"
         android:pathData="M 64 32 A 18 18 0 1 1 64 68 A 18 18 0 1 1 64 32" />
 
+    <!-- Перекрестие прицела (линии не касаются центральной точки) -->
     <path
-        android:strokeColor="#39FF14"
+        android:strokeColor="#32D74B"
         android:strokeWidth="3.5"
         android:strokeLineCap="round"
         android:pathData="M 36 50 L 58 50 M 70 50 L 92 50 M 64 22 L 64 44 M 64 56 L 64 78" />
 
+    <!-- Центральная зеленая точка -->
     <path
-        android:fillColor="#39FF14"
+        android:fillColor="#32D74B"
         android:pathData="M 64 46.5 A 3.5 3.5 0 1 1 64 53.5 A 3.5 3.5 0 1 1 64 46.5" />
 
 </vector>
