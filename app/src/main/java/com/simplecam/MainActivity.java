@@ -586,7 +586,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		// Чекбокс EIS: блокируется во время записи, чтобы не сбросить стабилизатор
 		// и не нарушить синхронизацию кольцевого буфера.
 		mCbEis = new CheckBox(this);
-		mCbEis.setText("HW EIS");
+		mCbEis.setText("ImageStab");
 		mCbEis.setTextColor(0xCCCCCCCC);
 		mCbEis.setTextSize(12);
 		mCbEis.setEnabled(false); // разблокируется после openCamera, если устройство поддерживает
@@ -1025,7 +1025,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 								mEisEnabled = false;
 								mCbEis.setText("HW EIS (не поддерживается)");
 							} else {
-								mCbEis.setText("HW EIS");
+								mCbEis.setText("ImageStab");
 							}
 						}
 					});
@@ -1567,7 +1567,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			// иначе аудио-поток может вызвать writePcmToWav с null-каналом.
 			if (mRecordWav) {
 				try {
-					startWavFile(recTag + ".wav", "DCIM/CaMic");
+					startWavFile(recTag + ".wav", "Music/CaMic");
 				} catch (Exception wavEx) {
 					// WAV ошибка не должна прерывать видеозапись — только предупреждаем
 					status("WAV: " + wavEx.getMessage());
