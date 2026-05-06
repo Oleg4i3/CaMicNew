@@ -32,10 +32,7 @@ import android.media.Image;
 import android.media.ImageReader;
 
 import java.io.File;
-import java.io.FileOutputStream;
 import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
-import java.nio.channels.FileChannel;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -158,6 +155,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private Uri mPendingUri;
 	private ParcelFileDescriptor mPfd;
 
+	// ─── WAV sidecar (несжатая параллельная дорожка) ─────────────────────────
+	private volatile boolean mRecordWav = false;
+	private CheckBox mCbRecordWav;
+	/** Кольцевой буфер сырого PCM для WAV — зеркалит mAudRing по глубине. */
+	private final java.util.ArrayDeque<PcmChunk> mPcmRing = new java.util.ArrayDeque<>();
+	private final Object mPcmRingLock = new Object();
+	/** 0=RING 1=FLUSH 2=LIVE — точная копия схемы mAudWriteMode */
+	private volatile int mPcmWriteMode = 0;
+	private final Object mWavLock = new Object();
+	private java.nio.channels.FileChannel mWavChannel;
+	private long mWavDataBytes = 0;
+	private Uri mWavPendingUri;
+	private ParcelFileDescriptor mWavPfd;
+
 	// ─── Аудио-источники ──────────────────────────────────────────────────────
 	private final List<AudioSrcItem> mSrcList = new ArrayList<>();
 
@@ -196,27 +207,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private volatile MediaFormat mVidOutFmt = null;
 	private volatile MediaFormat mAudOutFmt = null;
 	private volatile boolean mVidLoopRunning = false;
-
-	// ─── WAV параллельная запись ──────────────────────────────────────────────
-	private volatile boolean mWavEnabled = false;
-	private CheckBox mCbWavRecord;
-	// WAV-файл (открыт во время записи)
-	private FileOutputStream mWavFos;
-	private FileChannel      mWavChan;
-	private volatile boolean mWavWriting  = false;
-	private volatile long    mWavDataBytes = 0L;
-	private Uri              mWavPendingUri;
-	private ParcelFileDescriptor mWavPfd;
-
-	/** PCM-чанк для кольцевого буфера WAV (зеркало mAudRing, но в сыром PCM). */
-	private static class PcmChunk {
-		final short[] data; final int len; final long pts;
-		PcmChunk(short[] src, int n, long p) {
-			data = Arrays.copyOf(src, n); len = n; pts = p;
-		}
-	}
-	private final java.util.ArrayDeque<PcmChunk> mWavRing    = new java.util.ArrayDeque<>();
-	private final Object                          mWavRingLock = new Object();
 
 	// ─── Настройки ───────────────────────────────────────────────────────────
 	private volatile int  mVideoBps = VIDEO_BPS_DEFAULT;
@@ -596,7 +586,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		// Чекбокс EIS: блокируется во время записи, чтобы не сбросить стабилизатор
 		// и не нарушить синхронизацию кольцевого буфера.
 		mCbEis = new CheckBox(this);
-		mCbEis.setText("ImageStab");
+		mCbEis.setText("HW EIS");
 		mCbEis.setTextColor(0xCCCCCCCC);
 		mCbEis.setTextSize(12);
 		mCbEis.setEnabled(false); // разблокируется после openCamera, если устройство поддерживает
@@ -694,6 +684,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		pbRow.addView(cbPB); pbRow.addView(sbPB); pbRow.addView(tvPBLen);
 		settingsCol1.addView(pbRow);
 
+		// ── WAV sidecar ──────────────────────────────────────────────────────
+		mCbRecordWav = new CheckBox(this);
+		mCbRecordWav.setText("WAV (несжатый звук в отдельный файл)");
+		mCbRecordWav.setTextColor(0xCCCCCCCC);
+		mCbRecordWav.setTextSize(12);
+		mCbRecordWav.setOnCheckedChangeListener((cb, checked) -> {
+			if (mRecording) {
+				cb.setChecked(!checked);
+				status("WAV нельзя изменить во время записи");
+				return;
+			}
+			mRecordWav = checked;
+		});
+		settingsCol1.addView(mCbRecordWav);
+
 		// ── Битрейт видео ────────────────────────────────────────────────────
 		String[] bpsL={"500 kbps","1 Mbps","2 Mbps","3 Mbps","4 Mbps","6 Mbps (def)","8 Mbps","12 Mbps"};
 		int[] bpsV={500_000,1_000_000,2_000_000,3_000_000,4_000_000,6_000_000,8_000_000,12_000_000};
@@ -711,14 +716,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		bpsRow.addView(smallLabel("Bps: ")); bpsRow.addView(spBps);
 		settingsCol2.addView(smallLabel("Bitrate:"));
 		settingsCol2.addView(bpsRow);
-
-		// ── WAV параллельная запись ──────────────────────────────────────────
-		mCbWavRecord = new CheckBox(this);
-		mCbWavRecord.setText("WAV audio track");
-		mCbWavRecord.setTextColor(0xCCCCCCCC);
-		mCbWavRecord.setTextSize(12);
-		mCbWavRecord.setOnCheckedChangeListener((cb, checked) -> mWavEnabled = checked);
-		settingsCol2.addView(mCbWavRecord);
 		mAudioSrcPanel.addView(settingsCol1);
 		mAudioSrcPanel.addView(settingsCol2);
 
@@ -1147,9 +1144,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			mPauseStartNano = System.nanoTime();
 			mVidWriteMode = 0;
 			mAudWriteMode = 0;
+			mPcmWriteMode = 0; // WAV-кольцо тоже чистим
 			synchronized(mVidRingLock) { mVidRing.clear(); }
 			synchronized(mAudRingLock) { mAudRing.clear(); }
-			synchronized(mWavRingLock) { mWavRing.clear(); }
+			synchronized(mPcmRingLock) { mPcmRing.clear(); }
 			mBtnPause.setText("▶");
 			mBtnPause.setBackground(makeOval(0xFF228833));
 			status("⏸ Paused");
@@ -1165,6 +1163,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			mMuxBasePts += pauseDurUs; // вычитаем паузу из всех будущих PTS
 			mVidWriteMode = 2; // LIVE
 			mAudWriteMode = 2;
+			if (mRecordWav) mPcmWriteMode = 2; // WAV возобновляется тоже LIVE
 			mBtnPause.setText("⏸");
 			mBtnPause.setBackground(mBtnBgPause);
 			status("● REC (resumed)");
@@ -1356,7 +1355,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		if (mAudEnc != null) { try { mAudEnc.stop(); mAudEnc.release(); } catch (Exception ignored) {} mAudEnc = null; }
 		mAudOutFmt = null;
 		synchronized(mAudRingLock) { mAudRing.clear(); }
-		synchronized(mWavRingLock) { mWavRing.clear(); }
 	}
 
 	private void disableAudioEffects(int sid) {
@@ -1404,48 +1402,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			if (mEnvelope     != null) mEnvelope.pushSamples(buf, r, ch);
 			if (mSpectrum     != null) mSpectrum.pushSamples(buf, r, ch);
 
+			// ── WAV sidecar: кольцо / сброс / прямая запись (параллельно AAC) ──
+			// pts вычисляем ДО totalFrames += r/ch — тот же PTS, что уйдёт в AAC.
+			if (mRecordWav) {
+				handlePcmForWav(buf, r, startUs + totalFrames * 1_000_000L / AUDIO_SR);
+			}
+
 			// ── кодируем PCM→AAC ──────────────────────────────────────────────
 			MediaCodec enc = mAudEnc;
+			if (enc == null) continue;
 			// PTS: абсолютный System.nanoTime (мкс) — тот же домен, что у видео
 			long pts = startUs + totalFrames * 1_000_000L / AUDIO_SR;
 			totalFrames += r / ch;
-
-			// ── WAV параллельная запись (режим зеркалит mAudWriteMode) ────────
-			if (mWavEnabled) {
-				int wavMode = mAudWriteMode;
-				if (wavMode == 0) {
-					// RING: накапливаем PCM-кольцо по mPreBufSecs
-					PcmChunk chunk = new PcmChunk(buf, r, pts);
-					synchronized (mWavRingLock) {
-						mWavRing.addLast(chunk);
-						while (mWavRing.size() > 1) {
-							long span = mWavRing.peekLast().pts - mWavRing.peekFirst().pts;
-							if (span <= (long) mPreBufSecs * 1_200_000L) break;
-							mWavRing.removeFirst();
-						}
-					}
-				} else if (wavMode == 1) {
-					// FLUSH: сбрасываем кольцо (начиная с mMuxBasePts) + текущий чанк
-					if (mWavWriting) {
-						synchronized (mWavRingLock) {
-							boolean started = false;
-							for (PcmChunk pc : mWavRing) {
-								if (!started && pc.pts < mMuxBasePts) continue;
-								started = true;
-								writeWavPcm(pc.data, pc.len);
-							}
-							mWavRing.clear();
-						}
-						writeWavPcm(buf, r); // первый «живой» чанк
-					}
-					// mAudWriteMode → 2 выставит drainAudioEncoder ниже
-				} else {
-					// LIVE: пишем прямо в WAV-файл
-					if (mWavWriting) writeWavPcm(buf, r);
-				}
-			}
-
-			if (enc == null) continue;
 			int idx = enc.dequeueInputBuffer(5_000);
 			if (idx >= 0) {
 				ByteBuffer bb = enc.getInputBuffer(idx);
@@ -1562,10 +1530,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
 			// ── Создаём MediaStore-запись ──────────────────────────────────────
 			String displayPath;
-			long ts = System.currentTimeMillis();
+			// Общий таймстамп для mp4 и wav — файлы получат одинаковое имя с разным расширением
+			String recTag = "VID_" + System.currentTimeMillis();
 			if (Build.VERSION.SDK_INT >= 29) {
 				ContentValues cv = new ContentValues();
-				cv.put(MediaStore.Video.Media.DISPLAY_NAME, "VID_" + ts + ".mp4");
+				cv.put(MediaStore.Video.Media.DISPLAY_NAME, recTag + ".mp4");
 				cv.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
 				cv.put(MediaStore.Video.Media.RELATIVE_PATH, "DCIM/CaMic");
 				cv.put(MediaStore.Video.Media.IS_PENDING, 1);
@@ -1577,12 +1546,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				@SuppressWarnings("deprecation")
 				File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "CaMic");
 				dir.mkdirs();
-				File f = new File(dir, "VID_" + ts + ".mp4");
+				File f = new File(dir, recTag + ".mp4");
 				mMuxer = new MediaMuxer(f.getAbsolutePath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
 				displayPath = f.getAbsolutePath();
 			}
-			// ── WAV-файл (если включён) ─────────────────────────────────────────
-			if (mWavEnabled) openWavFile(ts);
 			@SuppressWarnings("deprecation")
 			int rot = getWindowManager().getDefaultDisplay().getRotation() * 90;
 			mMuxer.setOrientationHint((mSensorOrientation - rot + 360) % 360);
@@ -1595,14 +1562,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				mMuxReady = true;
 			}
 
+			// ── WAV sidecar: создаём файл ДО переключения режимов ─────────────
+			// Файл должен быть открыт раньше, чем mPcmWriteMode переключится в FLUSH,
+			// иначе аудио-поток может вызвать writePcmToWav с null-каналом.
+			if (mRecordWav) {
+				try {
+					startWavFile(recTag + ".wav", "DCIM/CaMic");
+				} catch (Exception wavEx) {
+					// WAV ошибка не должна прерывать видеозапись — только предупреждаем
+					status("WAV: " + wavEx.getMessage());
+				}
+			}
+
 			// ── Переводим потоки в режим FLUSH → они сами сбросят кольца ──────
 			mRecording = true;
 			if (mPreBufferEnabled) {
 				mVidWriteMode = 1; // FLUSH
 				mAudWriteMode = 1; // FLUSH
+				if (mRecordWav) mPcmWriteMode = 1; // FLUSH PCM-кольцо в WAV
 			} else {
 				mVidWriteMode = 2; // LIVE сразу
 				mAudWriteMode = 2;
+				if (mRecordWav) mPcmWriteMode = 2; // LIVE сразу
 			}
 
 			final String fp = displayPath;
@@ -1616,8 +1597,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				status("● REC  →  " + fp);
 			});
 		} catch (Exception e) {
-			mRecording = false; mVidWriteMode = 0; mAudWriteMode = 0;
+			mRecording = false; mVidWriteMode = 0; mAudWriteMode = 0; mPcmWriteMode = 0;
 			finalizeMuxer();
+			finalizeWavFile();
 			runOnUiThread(() -> {
 				mBtn.setText("⏺ REC"); mBtn.setBackground(mBtnBgIdle); mBtn.setEnabled(true);
 				mBtnPause.setVisibility(View.GONE);
@@ -1630,12 +1612,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private void doStop() {
 		// Даём энкодерам 200 мс выдать буферизованные пакеты
 		try { Thread.sleep(200); } catch (Exception ignored) {}
-		mVidWriteMode = 0; mAudWriteMode = 0; // обратно в RING
+		mVidWriteMode = 0; mAudWriteMode = 0; mPcmWriteMode = 0; // обратно в RING
 		finalizeMuxer();
+		finalizeWavFile(); // закрывает WAV (если был открыт)
 	}
 
 	private void finalizeMuxer() {
-		finalizeWav();
 		synchronized(mMuxLock) {
 			try { if (mMuxer != null) { if (mMuxReady) mMuxer.stop(); mMuxer.release(); } }
 			catch (Exception ignored) {}
@@ -1658,111 +1640,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		});
 	}
 
-
-	// =========================================================================
-	// WAV параллельная запись
-	// =========================================================================
-
-	/** Открывает WAV-файл с тем же timestamp, что и MP4. */
-	private void openWavFile(long ts) {
-		try {
-			mWavDataBytes = 0L;
-			if (Build.VERSION.SDK_INT >= 29) {
-				ContentValues cv = new ContentValues();
-				cv.put(MediaStore.Audio.Media.DISPLAY_NAME, "VID_" + ts + ".wav");
-				cv.put(MediaStore.Audio.Media.MIME_TYPE, "audio/wav");
-				cv.put(MediaStore.Audio.Media.RELATIVE_PATH, "DCIM/CaMic");
-				cv.put(MediaStore.Audio.Media.IS_PENDING, 1);
-				mWavPendingUri = getContentResolver().insert(
-						MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, cv);
-				mWavPfd = getContentResolver().openFileDescriptor(mWavPendingUri, "rw");
-				mWavFos  = new FileOutputStream(mWavPfd.getFileDescriptor());
-			} else {
-				@SuppressWarnings("deprecation")
-				File dir = new File(
-						Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM),
-						"CaMic");
-				dir.mkdirs();
-				mWavFos = new FileOutputStream(new File(dir, "VID_" + ts + ".wav"));
-			}
-			mWavChan = mWavFos.getChannel();
-			// Placeholder 44-байтный заголовок (размер data = 0 пока)
-			mWavChan.write(ByteBuffer.wrap(makeWavHeader(0L, mAudChannels, AUDIO_SR)));
-			mWavWriting = true;
-		} catch (Exception e) {
-			mWavWriting = false;
-			status("WAV open error: " + e.getMessage());
-		}
-	}
-
-	/** Патчит заголовок и закрывает WAV-файл. Вызывается из finalizeMuxer(). */
-	private void finalizeWav() {
-		if (!mWavWriting) return;
-		mWavWriting = false;
-		FileChannel chan = mWavChan;
-		if (chan != null) {
-			try {
-				chan.position(0);
-				chan.write(ByteBuffer.wrap(makeWavHeader(mWavDataBytes, mAudChannels, AUDIO_SR)));
-				chan.close();
-			} catch (Exception ignored) {}
-			mWavChan = null;
-		}
-		try { if (mWavFos != null) { mWavFos.close(); mWavFos = null; } }
-		catch (Exception ignored) {}
-		try { if (mWavPfd != null) { mWavPfd.close(); mWavPfd = null; } }
-		catch (Exception ignored) {}
-		if (Build.VERSION.SDK_INT >= 29 && mWavPendingUri != null) {
-			ContentValues cv = new ContentValues();
-			cv.put(MediaStore.Audio.Media.IS_PENDING, 0);
-			getContentResolver().update(mWavPendingUri, cv, null, null);
-			mWavPendingUri = null;
-		}
-		synchronized (mWavRingLock) { mWavRing.clear(); }
-	}
-
-	/** Пишет PCM-семплы (short[]) в WAV-файл. Вызывается из audioMainLoop. */
-	private void writeWavPcm(short[] buf, int len) {
-		FileChannel chan = mWavChan;
-		if (chan == null) return;
-		try {
-			ByteBuffer bb = ByteBuffer.allocate(len * 2).order(ByteOrder.LITTLE_ENDIAN);
-			for (int i = 0; i < len; i++) bb.putShort(buf[i]);
-			bb.flip();
-			chan.write(bb);
-			mWavDataBytes += len * 2L;
-		} catch (Exception ignored) {}
-	}
-
-	/** Строит 44-байтный RIFF/WAV заголовок для PCM 16-bit. */
-	private static byte[] makeWavHeader(long dataBytes, int channels, int sampleRate) {
-		int byteRate   = sampleRate * channels * 2;
-		int blockAlign = channels * 2;
-		byte[] h = new byte[44];
-		// RIFF chunk
-		h[0]='R'; h[1]='I'; h[2]='F'; h[3]='F';
-		le32(h,  4, (int)(36 + dataBytes));
-		h[8]='W'; h[9]='A'; h[10]='V'; h[11]='E';
-		// fmt  chunk
-		h[12]='f'; h[13]='m'; h[14]='t'; h[15]=' ';
-		le32(h, 16, 16);             // subchunk1 size
-		le16(h, 20, (short) 1);      // PCM
-		le16(h, 22, (short) channels);
-		le32(h, 24, sampleRate);
-		le32(h, 28, byteRate);
-		le16(h, 32, (short) blockAlign);
-		le16(h, 34, (short) 16);     // bits per sample
-		// data chunk
-		h[36]='d'; h[37]='a'; h[38]='t'; h[39]='a';
-		le32(h, 40, (int) dataBytes);
-		return h;
-	}
-	private static void le32(byte[] b, int o, int v) {
-		b[o]=(byte)v; b[o+1]=(byte)(v>>8); b[o+2]=(byte)(v>>16); b[o+3]=(byte)(v>>24);
-	}
-	private static void le16(byte[] b, int o, short v) {
-		b[o]=(byte)v; b[o+1]=(byte)(v>>8);
-	}
 
 	private void status(String s) {
 		runOnUiThread(() -> mTvStatus.setText(s));
@@ -1848,7 +1725,170 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	// =========================================================================
 	// Вспомогательные классы
 	// =========================================================================
-	
+
+	// ─── WAV sidecar: контейнер PCM-чанка с временной меткой ────────────────
+	private static class PcmChunk {
+		final short[] data;
+		final int len;
+		final long pts; // мкс, тот же CLOCK_MONOTONIC что у видео/AAC
+
+		PcmChunk(short[] src, int l, long p) {
+			data = java.util.Arrays.copyOfRange(src, 0, l);
+			len  = l;
+			pts  = p;
+		}
+	}
+
+	// ─── WAV sidecar: аудио-поток → кольцо / сброс / файл ───────────────────
+
+	/**
+	 * Вызывается из audioMainLoop ПОСЛЕ обработки gain/softclip.
+	 * Зеркалит логику drainAudioEncoder: RING→FLUSH→LIVE.
+	 * Переключение RING→FLUSH→LIVE происходит здесь — в аудио-потоке,
+	 * атомарно, без пропущенных сэмплов.
+	 */
+	private void handlePcmForWav(short[] buf, int len, long pts) {
+		int mode = mPcmWriteMode;
+		if (mode == 0) {
+			// ── RING: накапливаем, обрезаем по mPreBufSecs + запас ──────────
+			PcmChunk chunk = new PcmChunk(buf, len, pts);
+			synchronized (mPcmRingLock) {
+				mPcmRing.addLast(chunk);
+				long keepUs = (long)(mPreBufSecs + 1) * 1_200_000L;
+				while (mPcmRing.size() > 1 &&
+						mPcmRing.peekLast().pts - mPcmRing.peekFirst().pts > keepUs) {
+					mPcmRing.removeFirst();
+				}
+			}
+		} else if (mode == 1) {
+			// ── FLUSH: сбрасываем кольцо начиная с mMuxBasePts, затем текущий чанк ──
+			// mMuxBasePts — PTS первого I-frame видео; аудио и PCM синхронизированы
+			// через общий CLOCK_MONOTONIC → буфер начнётся точно с нужного момента.
+			synchronized (mPcmRingLock) {
+				for (PcmChunk c : mPcmRing) {
+					if (c.pts < mMuxBasePts) continue; // пропускаем до точки старта
+					writePcmToWav(c.data, c.len);
+				}
+				mPcmRing.clear();
+			}
+			writePcmToWav(buf, len); // первый «живой» чанк
+			mPcmWriteMode = 2; // LIVE
+		} else { // mode == 2
+			// ── LIVE: напрямую в файл ───────────────────────────────────────
+			writePcmToWav(buf, len);
+		}
+	}
+
+	/** Пишет len сэмплов из short[] в WAV-канал (16-bit LE). Потокобезопасно. */
+	private void writePcmToWav(short[] buf, int len) {
+		synchronized (mWavLock) {
+			java.nio.channels.FileChannel ch = mWavChannel;
+			if (ch == null) return;
+			try {
+				java.nio.ByteBuffer bb = java.nio.ByteBuffer.allocate(len * 2);
+				bb.order(java.nio.ByteOrder.LITTLE_ENDIAN);
+				for (int i = 0; i < len; i++) bb.putShort(buf[i]);
+				bb.flip();
+				ch.write(bb);
+				mWavDataBytes += len * 2L;
+			} catch (Exception ignored) {}
+		}
+	}
+
+	/**
+	 * Создаёт WAV-файл рядом с MP4, пишет 44-байтный placeholder-заголовок.
+	 * @param wavName  отображаемое имя файла (напр. "VID_1234.wav")
+	 * @param relPath  путь в MediaStore (напр. "DCIM/CaMic"), используется только
+	 *                 на Android 10+; на старых версиях файл кладётся в DCIM/CaMic.
+	 */
+	private void startWavFile(String wavName, String relPath) throws Exception {
+		mWavDataBytes = 0;
+		if (Build.VERSION.SDK_INT >= 29) {
+			ContentValues cv = new ContentValues();
+			cv.put(MediaStore.Audio.Media.DISPLAY_NAME, wavName);
+			cv.put(MediaStore.Audio.Media.MIME_TYPE, "audio/wav");
+			cv.put(MediaStore.Audio.Media.RELATIVE_PATH, relPath);
+			cv.put(MediaStore.Audio.Media.IS_PENDING, 1);
+			mWavPendingUri = getContentResolver().insert(
+					MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, cv);
+			mWavPfd = getContentResolver().openFileDescriptor(mWavPendingUri, "rw");
+			// FileOutputStream + getChannel() поддерживает position() — нужно для обновления заголовка
+			java.io.FileOutputStream fos =
+					new java.io.FileOutputStream(mWavPfd.getFileDescriptor());
+			mWavChannel = fos.getChannel();
+		} else {
+			@SuppressWarnings("deprecation")
+			File dir = new File(
+					Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM),
+					"CaMic");
+			dir.mkdirs();
+			// RandomAccessFile нужен для seek при финализации заголовка
+			mWavChannel = new java.io.RandomAccessFile(new File(dir, wavName), "rw").getChannel();
+		}
+		// Записываем placeholder-заголовок (размеры = 0, обновятся в finalizeWavFile)
+		synchronized (mWavLock) {
+			java.nio.ByteBuffer hdr = buildWavHeader(0L);
+			mWavChannel.position(0);
+			mWavChannel.write(hdr);
+		}
+	}
+
+	/** Строит 44-байтный WAV-заголовок (PCM, 16-bit LE). */
+	private java.nio.ByteBuffer buildWavHeader(long dataBytes) {
+		int ch = (mAudChannels >= 1 && mAudChannels <= 2) ? mAudChannels : 1;
+		java.nio.ByteBuffer bb = java.nio.ByteBuffer.allocate(44);
+		bb.order(java.nio.ByteOrder.LITTLE_ENDIAN);
+		// RIFF chunk
+		bb.put(new byte[]{'R','I','F','F'});
+		bb.putInt((int)(36L + dataBytes));   // размер без первых 8 байт
+		bb.put(new byte[]{'W','A','V','E'});
+		// fmt chunk
+		bb.put(new byte[]{'f','m','t',' '});
+		bb.putInt(16);                        // размер fmt = 16 (PCM)
+		bb.putShort((short) 1);               // AudioFormat: PCM
+		bb.putShort((short) ch);
+		bb.putInt(AUDIO_SR);
+		bb.putInt(AUDIO_SR * ch * 2);         // ByteRate
+		bb.putShort((short)(ch * 2));         // BlockAlign
+		bb.putShort((short) 16);              // BitsPerSample
+		// data chunk
+		bb.put(new byte[]{'d','a','t','a'});
+		bb.putInt((int) dataBytes);
+		bb.flip();
+		return bb;
+	}
+
+	/**
+	 * Финализирует WAV: перезаписывает заголовок с правильными размерами,
+	 * закрывает файл, снимает IS_PENDING в MediaStore.
+	 * Безопасно вызывать даже если WAV не запускался (mWavChannel == null).
+	 */
+	private void finalizeWavFile() {
+		java.nio.channels.FileChannel ch;
+		synchronized (mWavLock) {
+			ch = mWavChannel;
+			mWavChannel = null; // аудио-поток больше не пишет
+		}
+		mPcmWriteMode = 0;
+		synchronized (mPcmRingLock) { mPcmRing.clear(); }
+		if (ch == null) return;
+		try {
+			// Обновляем заголовок с реальными размерами
+			java.nio.ByteBuffer hdr = buildWavHeader(mWavDataBytes);
+			ch.position(0);
+			ch.write(hdr);
+			ch.close();
+		} catch (Exception ignored) {}
+		try { if (mWavPfd != null) { mWavPfd.close(); mWavPfd = null; } } catch (Exception ignored) {}
+		if (Build.VERSION.SDK_INT >= 29 && mWavPendingUri != null) {
+			ContentValues cv = new ContentValues();
+			cv.put(MediaStore.Audio.Media.IS_PENDING, 0);
+			getContentResolver().update(mWavPendingUri, cv, null, null);
+			mWavPendingUri = null;
+		}
+		mWavDataBytes = 0;
+	}
+
 	private static class AudioSrcItem {
 		final String name;
 		final int audioSource;
