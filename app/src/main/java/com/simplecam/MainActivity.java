@@ -727,8 +727,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		spRes.setAdapter(resAd); spRes.setSelection(1); // Full HD по умолчанию
 		spRes.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
 			public void onItemSelected(AdapterView<?> p, View v, int pos, long id) {
-				if (pos == 0) { mVideoW = 1280; mVideoH = 720; }
-				else          { mVideoW = 1920; mVideoH = 1080; }
+				int newW = (pos == 0) ? 1280 : 1920;
+				int newH = (pos == 0) ? 720  : 1080;
+				if (newW == mVideoW && newH == mVideoH) return; // без изменений
+				if (mRecording) return;                         // во время записи не трогаем
+				mVideoW = newW; mVideoH = newH;
+				// Пересоздаём энкодер с новым разрешением и перезапускаем capture session
+				if (mVidEnc != null) {
+					try { mVidEnc.stop(); mVidEnc.release(); } catch (Exception ignored) {}
+					mVidEnc = null;
+				}
+				if (mEncSurface != null) {
+					try { mEncSurface.release(); } catch (Exception ignored) {}
+					mEncSurface = null;
+				}
+				startPreview();
 			}
 			public void onNothingSelected(AdapterView<?> p) {}
 		});
@@ -2781,7 +2794,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		private final Paint mBgPaint = new Paint();
 		
 		private static final int DISPLAY_BINS = 60; // уменьшено вдвое
-		private static final float SAMPLE_RATE = 44100f;
+		private static final float SAMPLE_RATE = 48000f;
 		private static final float DECAY = 0.82f;    // коэффициент спада сглаженного
 		private static final float PEAK_DECAY = 0.996f;
 		
