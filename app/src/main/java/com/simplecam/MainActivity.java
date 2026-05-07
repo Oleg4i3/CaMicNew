@@ -210,6 +210,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
 	// ─── Настройки ───────────────────────────────────────────────────────────
 	private volatile int  mVideoBps = VIDEO_BPS_DEFAULT;
+	private volatile int  mVideoW   = 1920;   // 1280 или 1920
+	private volatile int  mVideoH   = 1080;   // 720  или 1080
 	private volatile int  mPreBufSecs = 1;          // 1..5 секунд
 	private volatile boolean mPreBufferEnabled = true;
 	private volatile int  mEvComp = 0;
@@ -716,6 +718,27 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		bpsRow.addView(smallLabel("Bps: ")); bpsRow.addView(spBps);
 		settingsCol2.addView(smallLabel("Bitrate:"));
 		settingsCol2.addView(bpsRow);
+
+		// ── Выбор разрешения ────────────────────────────────────────────────
+		String[] resL = {"HD  1280×720", "Full HD  1920×1080"};
+		Spinner spRes = new Spinner(this);
+		ArrayAdapter<String> resAd = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, resL);
+		resAd.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+		spRes.setAdapter(resAd); spRes.setSelection(1); // Full HD по умолчанию
+		spRes.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+			public void onItemSelected(AdapterView<?> p, View v, int pos, long id) {
+				if (pos == 0) { mVideoW = 1280; mVideoH = 720; }
+				else          { mVideoW = 1920; mVideoH = 1080; }
+			}
+			public void onNothingSelected(AdapterView<?> p) {}
+		});
+		LinearLayout resRow = new LinearLayout(this);
+		resRow.setOrientation(LinearLayout.HORIZONTAL); resRow.setGravity(Gravity.CENTER_VERTICAL);
+		resRow.addView(spRes);
+		settingsCol2.addView(smallLabel("Resolution:"));
+		settingsCol2.addView(resRow);
+		// ────────────────────────────────────────────────────────────────────
+
 		mAudioSrcPanel.addView(settingsCol1);
 		mAudioSrcPanel.addView(settingsCol2);
 
@@ -1199,7 +1222,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			try {
 				if (mVidEnc != null) { try{mVidEnc.stop();mVidEnc.release();}catch(Exception e){} mVidEnc=null; }
 				if (mEncSurface != null) { try{mEncSurface.release();}catch(Exception e){} mEncSurface=null; }
-				MediaFormat vf = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, VIDEO_W, VIDEO_H);
+				MediaFormat vf = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, mVideoW, mVideoH);
 				vf.setInteger(MediaFormat.KEY_BIT_RATE, mVideoBps);
 				vf.setInteger(MediaFormat.KEY_FRAME_RATE, VIDEO_FPS);
 				vf.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
