@@ -1491,9 +1491,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				if (ns != null) {
 					ns.setEnabled(mNcEnabled);
 					if (mNcEnabled) {
-						// Попытка установить агрессивность (вендор-специфичный параметр 0).
-						// На устройствах без поддержки — silently ignored.
-						try { ns.setParameter(0, mNcLevel); } catch (Exception ignored2) {}
+						// NoiseSuppressor.setParameter(int,int) наследуется от AudioEffect,
+						// но помечен @hide в публичном SDK — вызываем через рефлексию.
+						// На устройствах, где вендор не реализовал этот параметр, silently ignored.
+						try {
+							java.lang.reflect.Method m = ns.getClass()
+								.getMethod("setParameter", int.class, int.class);
+							m.invoke(ns, 0, mNcLevel);
+						} catch (Exception ignored2) {}
 					}
 					ns.release();
 				}
