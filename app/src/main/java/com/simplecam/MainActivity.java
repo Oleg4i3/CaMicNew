@@ -169,6 +169,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private Uri mWavPendingUri;
 	private ParcelFileDescriptor mWavPfd;
 
+	// ─── AGC / NC ─────────────────────────────────────────────────────────────
+	private volatile boolean mAgcEnabled  = false;
+	private volatile boolean mNcEnabled   = false;
+	private volatile int     mNcLevel     = 2;   // 0..3 агрессивность
+	private boolean mAgcAvailable = false;
+	private boolean mNcAvailable  = false;
+	private CheckBox  mCbAgc, mCbNc;
+	private LinearLayout mNcLevelRow;            // строка слайдера агрессивности
+	private TextView mTvNcLevel;
+
 	// ─── Аудио-источники ──────────────────────────────────────────────────────
 	private final List<AudioSrcItem> mSrcList = new ArrayList<>();
 
@@ -750,6 +760,73 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		resRow.addView(spRes);
 		settingsCol2.addView(smallLabel("Resolution:"));
 		settingsCol2.addView(resRow);
+
+		// ── AGC / NC (проверяем доступность статически) ──────────────────────
+		mAgcAvailable = AutomaticGainControl.isAvailable();
+		mNcAvailable  = NoiseSuppressor.isAvailable();
+
+		if (mAgcAvailable || mNcAvailable) {
+			settingsCol2.addView(smallLabel("Audio FX:"));
+
+			LinearLayout fxRow = new LinearLayout(this);
+			fxRow.setOrientation(LinearLayout.HORIZONTAL);
+			fxRow.setGravity(Gravity.CENTER_VERTICAL);
+
+			if (mAgcAvailable) {
+				mCbAgc = new CheckBox(this);
+				mCbAgc.setText("AGC");
+				mCbAgc.setTextColor(0xCCCCCCCC);
+				mCbAgc.setTextSize(12);
+				mCbAgc.setChecked(false);
+				mCbAgc.setOnCheckedChangeListener((cb, on) -> {
+					mAgcEnabled = on;
+					applyAudioEffects();
+				});
+				fxRow.addView(mCbAgc);
+			}
+
+			if (mNcAvailable) {
+				mCbNc = new CheckBox(this);
+				mCbNc.setText("NC");
+				mCbNc.setTextColor(0xCCCCCCCC);
+				mCbNc.setTextSize(12);
+				mCbNc.setChecked(false);
+				mCbNc.setOnCheckedChangeListener((cb, on) -> {
+					mNcEnabled = on;
+					if (mNcLevelRow != null)
+						mNcLevelRow.setVisibility(on ? View.VISIBLE : View.GONE);
+					applyAudioEffects();
+				});
+				fxRow.addView(mCbNc);
+			}
+			settingsCol2.addView(fxRow);
+
+			// NC aggressiveness — только если NC поддерживается
+			if (mNcAvailable) {
+				mNcLevelRow = new LinearLayout(this);
+				mNcLevelRow.setOrientation(LinearLayout.HORIZONTAL);
+				mNcLevelRow.setGravity(Gravity.CENTER_VERTICAL);
+				mNcLevelRow.setVisibility(View.GONE);
+
+				mTvNcLevel = smallLabel("NC lv:2");
+				SeekBar sbNcLvl = new SeekBar(this);
+				sbNcLvl.setMax(3);
+				sbNcLvl.setProgress(2);
+				sbNcLvl.setLayoutParams(new LinearLayout.LayoutParams(dp(80), ViewGroup.LayoutParams.WRAP_CONTENT));
+				sbNcLvl.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+					public void onProgressChanged(SeekBar s, int p, boolean u) {
+						mNcLevel = p;
+						if (mTvNcLevel != null) mTvNcLevel.setText("NC lv:" + p);
+						if (mNcEnabled) applyAudioEffects();
+					}
+					public void onStartTrackingTouch(SeekBar s) {}
+					public void onStopTrackingTouch(SeekBar s) {}
+				});
+				mNcLevelRow.addView(mTvNcLevel);
+				mNcLevelRow.addView(sbNcLvl);
+				settingsCol2.addView(mNcLevelRow);
+			}
+		}
 		// ────────────────────────────────────────────────────────────────────
 
 		mAudioSrcPanel.addView(settingsCol1);
@@ -1362,7 +1439,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		if (rec.getState() != AudioRecord.STATE_INITIALIZED) { rec.release(); return; }
 		if (Build.VERSION.SDK_INT >= 23 && src2 != null && src2.device != null)
 			rec.setPreferredDevice(src2.device);
-		disableAudioEffects(rec.getAudioSessionId());
+		configureAudioEffects(rec.getAudioSessionId());
 		mAudRec = rec; mAudChannels = channels;
 
 		// Создаём аудио-энкодер
@@ -1393,10 +1470,50 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		synchronized(mAudRingLock) { mAudRing.clear(); }
 	}
 
-	private void disableAudioEffects(int sid) {
-		try { if (AutomaticGainControl.isAvailable()) { AutomaticGainControl a = AutomaticGainControl.create(sid); if (a!=null){a.setEnabled(false);a.release();} } } catch (Exception ignored) {}
-		try { if (NoiseSuppressor.isAvailable()) { NoiseSuppressor n = NoiseSuppressor.create(sid); if (n!=null){n.setEnabled(false);n.release();} } } catch (Exception ignored) {}
-		try { if (AcousticEchoCanceler.isAvailable()) { AcousticEchoCanceler e = AcousticEchoCanceler.create(sid); if (e!=null){e.setEnabled(false);e.release();} } } catch (Exception ignored) {}
+	/**
+	 * Применяет текущие настройки AGC/NC/AEC к сессии по её ID.
+	 * Вызывается из startMonitor() после создания AudioRecord,
+	 * а также из UI при изменении чекбоксов/слайдера.
+	 */
+	private void configureAudioEffects(int sid) {
+		// AGC
+		try {
+			if (AutomaticGainControl.isAvailable()) {
+				AutomaticGainControl agc = AutomaticGainControl.create(sid);
+				if (agc != null) { agc.setEnabled(mAgcEnabled); agc.release(); }
+			}
+		} catch (Exception ignored) {}
+
+		// NC
+		try {
+			if (NoiseSuppressor.isAvailable()) {
+				NoiseSuppressor ns = NoiseSuppressor.create(sid);
+				if (ns != null) {
+					ns.setEnabled(mNcEnabled);
+					if (mNcEnabled) {
+						// Попытка установить агрессивность (вендор-специфичный параметр 0).
+						// На устройствах без поддержки — silently ignored.
+						try { ns.setParameter(0, mNcLevel); } catch (Exception ignored2) {}
+					}
+					ns.release();
+				}
+			}
+		} catch (Exception ignored) {}
+
+		// AEC — для съёмочной камеры всегда выкл
+		try {
+			if (AcousticEchoCanceler.isAvailable()) {
+				AcousticEchoCanceler aec = AcousticEchoCanceler.create(sid);
+				if (aec != null) { aec.setEnabled(false); aec.release(); }
+			}
+		} catch (Exception ignored) {}
+	}
+
+	/** Применяет текущие настройки к активной AudioRecord сессии (вызов из UI). */
+	private void applyAudioEffects() {
+		AudioRecord rec = mAudRec;
+		if (rec == null) return;
+		configureAudioEffects(rec.getAudioSessionId());
 	}
 
 	/**
@@ -1685,77 +1802,149 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	// Аудио-источники
 	// =========================================================================
 	
+	/**
+	 * Пробует создать AudioRecord с заданным audioSource.
+	 * Возвращает true, если источник инициализировался успешно.
+	 * Метод вызывается из фонового потока.
+	 */
+	@SuppressLint("MissingPermission")
+	private boolean probeAudioSource(int src) {
+		try {
+			int minBuf = AudioRecord.getMinBufferSize(
+				AUDIO_SR, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
+			if (minBuf <= 0) return false;
+			AudioRecord ar = new AudioRecord(
+				src, AUDIO_SR, AudioFormat.CHANNEL_IN_MONO,
+				AudioFormat.ENCODING_PCM_16BIT, minBuf);
+			boolean ok = ar.getState() == AudioRecord.STATE_INITIALIZED;
+			ar.release();
+			return ok;
+		} catch (Exception e) {
+			return false;
+		}
+	}
+
 	private void buildAudioSources() {
-		List<AudioSrcItem> list = new ArrayList<>();
-		if (Build.VERSION.SDK_INT >= 23) {
-			AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
-			AudioDeviceInfo[] devs = am.getDevices(AudioManager.GET_DEVICES_INPUTS);
-			boolean hasBuiltin = false;
-			for (AudioDeviceInfo d : devs) {
-				int t = d.getType();
-				if (t == AudioDeviceInfo.TYPE_BUILTIN_MIC) {
-					if (hasBuiltin)
-					continue;
-					hasBuiltin = true;
-					list.add(new AudioSrcItem("Built-in mic", MediaRecorder.AudioSource.MIC, d));
-					if (Build.VERSION.SDK_INT >= 24)
-					list.add(new AudioSrcItem("Built-in mic (raw)", MediaRecorder.AudioSource.UNPROCESSED, d));
-					} else if (t == AudioDeviceInfo.TYPE_USB_DEVICE || t == AudioDeviceInfo.TYPE_USB_HEADSET) {
-					CharSequence pn = d.getProductName();
-					list.add(new AudioSrcItem("USB: " + (pn != null && pn.length() > 0 ? pn : "audio"),
-					MediaRecorder.AudioSource.MIC, d));
+		// Зондирование запускаем в фоновом потоке — каждое AudioRecord.create занимает время
+		new Thread(() -> {
+			List<AudioSrcItem> list = new ArrayList<>();
+
+			if (Build.VERSION.SDK_INT >= 23) {
+				AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
+				AudioDeviceInfo[] devs = am.getDevices(AudioManager.GET_DEVICES_INPUTS);
+				boolean hasBuiltin = false;
+
+				for (AudioDeviceInfo d : devs) {
+					int t = d.getType();
+					if (t == AudioDeviceInfo.TYPE_BUILTIN_MIC) {
+						if (hasBuiltin) continue;
+						hasBuiltin = true;
+
+						// Форсированно пробуем все стандартные источники на встроенном микрофоне.
+						// В спиннере показываем только те, которые реально инициализировались.
+						int[][] candidates = {
+							{MediaRecorder.AudioSource.MIC,                   0},
+							{MediaRecorder.AudioSource.CAMCORDER,             0},
+							{MediaRecorder.AudioSource.VOICE_RECOGNITION,     0},
+							{MediaRecorder.AudioSource.VOICE_COMMUNICATION,   0},
+						};
+						String[] candidateNames = {
+							"Built-in mic",
+							"Camcorder",
+							"Voice recognition",
+							"Voice comm.",
+						};
+						for (int i = 0; i < candidates.length; i++) {
+							if (probeAudioSource(candidates[i][0]))
+								list.add(new AudioSrcItem(candidateNames[i], candidates[i][0], d));
+						}
+						// UNPROCESSED — API 24+
+						if (Build.VERSION.SDK_INT >= 24 &&
+								probeAudioSource(MediaRecorder.AudioSource.UNPROCESSED))
+							list.add(new AudioSrcItem("Unprocessed (raw)",
+								MediaRecorder.AudioSource.UNPROCESSED, d));
+
+					} else if (t == AudioDeviceInfo.TYPE_USB_DEVICE ||
+								t == AudioDeviceInfo.TYPE_USB_HEADSET) {
+						CharSequence pn = d.getProductName();
+						list.add(new AudioSrcItem(
+							"USB: " + (pn != null && pn.length() > 0 ? pn : "audio"),
+							MediaRecorder.AudioSource.MIC, d));
 					} else if (t == AudioDeviceInfo.TYPE_WIRED_HEADSET) {
-					list.add(new AudioSrcItem("Wired headset", MediaRecorder.AudioSource.MIC, d));
+						list.add(new AudioSrcItem("Wired headset",
+							MediaRecorder.AudioSource.MIC, d));
 					} else if (t == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
-					list.add(new AudioSrcItem("Bluetooth mic", MediaRecorder.AudioSource.MIC, d));
-				}
-			}
-		}
-		if (list.isEmpty()) {
-			list.add(new AudioSrcItem("Default", MediaRecorder.AudioSource.DEFAULT, null));
-			list.add(new AudioSrcItem("Microphone", MediaRecorder.AudioSource.MIC, null));
-			list.add(new AudioSrcItem("Camcorder", MediaRecorder.AudioSource.CAMCORDER, null));
-			list.add(new AudioSrcItem("Communication", MediaRecorder.AudioSource.VOICE_COMMUNICATION, null));
-			if (Build.VERSION.SDK_INT >= 24)
-			list.add(new AudioSrcItem("Unprocessed (raw)", MediaRecorder.AudioSource.UNPROCESSED, null));
-		}
-		runOnUiThread(() -> {
-			mSrcList.clear();
-			mSrcList.addAll(list);
-			List<String> names = new ArrayList<>();
-			for (AudioSrcItem item : mSrcList)
-			names.add(item.name);
-			@SuppressWarnings("unchecked")
-			ArrayAdapter<String> ad2 = (ArrayAdapter<String>) mSpinner.getAdapter();
-			ad2.clear();
-			ad2.addAll(names);
-			ad2.notifyDataSetChanged();
-			
-			int defaultIdx = 0;
-			for (int i = 0; i < mSrcList.size(); i++) {
-				AudioSrcItem item = mSrcList.get(i);
-				if (item.device != null && Build.VERSION.SDK_INT >= 23) {
-					int t = item.device.getType();
-					if (t == AudioDeviceInfo.TYPE_USB_DEVICE || t == AudioDeviceInfo.TYPE_USB_HEADSET) {
-						defaultIdx = i;
-						break;
+						list.add(new AudioSrcItem("Bluetooth mic",
+							MediaRecorder.AudioSource.MIC, d));
 					}
 				}
 			}
-			if (defaultIdx == 0) {
+
+			// Фолбэк: если ни одного источника не обнаружено — пробуем все подряд без device
+			if (list.isEmpty()) {
+				int[] fallbackSrc  = {
+					MediaRecorder.AudioSource.MIC,
+					MediaRecorder.AudioSource.CAMCORDER,
+					MediaRecorder.AudioSource.VOICE_RECOGNITION,
+					MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+				};
+				String[] fallbackNames = {
+					"Microphone", "Camcorder", "Voice recognition", "Voice comm."
+				};
+				for (int i = 0; i < fallbackSrc.length; i++) {
+					if (probeAudioSource(fallbackSrc[i]))
+						list.add(new AudioSrcItem(fallbackNames[i], fallbackSrc[i], null));
+				}
+				if (Build.VERSION.SDK_INT >= 24 &&
+						probeAudioSource(MediaRecorder.AudioSource.UNPROCESSED))
+					list.add(new AudioSrcItem("Unprocessed (raw)",
+						MediaRecorder.AudioSource.UNPROCESSED, null));
+				// Абсолютный фолбэк — хоть что-то
+				if (list.isEmpty())
+					list.add(new AudioSrcItem("Default",
+						MediaRecorder.AudioSource.DEFAULT, null));
+			}
+
+			final List<AudioSrcItem> finalList = list;
+			runOnUiThread(() -> {
+				mSrcList.clear();
+				mSrcList.addAll(finalList);
+				List<String> names = new ArrayList<>();
+				for (AudioSrcItem item : mSrcList) names.add(item.name);
+				@SuppressWarnings("unchecked")
+				ArrayAdapter<String> ad2 = (ArrayAdapter<String>) mSpinner.getAdapter();
+				ad2.clear();
+				ad2.addAll(names);
+				ad2.notifyDataSetChanged();
+
+				// Выбор источника по умолчанию: USB → UNPROCESSED → первый
+				int defaultIdx = 0;
 				for (int i = 0; i < mSrcList.size(); i++) {
-					if (mSrcList.get(i).audioSource == MediaRecorder.AudioSource.UNPROCESSED) {
-						defaultIdx = i;
-						break;
+					AudioSrcItem item = mSrcList.get(i);
+					if (item.device != null && Build.VERSION.SDK_INT >= 23) {
+						int t = item.device.getType();
+						if (t == AudioDeviceInfo.TYPE_USB_DEVICE ||
+								t == AudioDeviceInfo.TYPE_USB_HEADSET) {
+							defaultIdx = i;
+							break;
+						}
 					}
 				}
-			}
-			mSpinner.setSelection(defaultIdx);
-			if (!mRecording) {
-				stopAudio();
-				startMonitor();
-			}
-		});
+				if (defaultIdx == 0) {
+					for (int i = 0; i < mSrcList.size(); i++) {
+						if (mSrcList.get(i).audioSource == MediaRecorder.AudioSource.UNPROCESSED) {
+							defaultIdx = i;
+							break;
+						}
+					}
+				}
+				mSpinner.setSelection(defaultIdx);
+				if (!mRecording) {
+					stopAudio();
+					startMonitor();
+				}
+			});
+		}, "audio-probe").start();
 	}
 	
 	// =========================================================================
