@@ -189,7 +189,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private boolean mNcGateOpen = true;
 	// ── Открытые параметры гейта (регулируются слайдерами) ───────────────────
 	/** Множитель порога открытия: openThresh = floor × mNcThreshMult */
-	private volatile float mNcThreshMult = 3.0f;  // 1.5 .. 10
+	private volatile float mNcThreshMult = 2.0f;  // 1.0 .. 10
+	/** Остаточный gain когда гейт закрыт: 0=тишина, 1=без подавления (экспандер) */
+	private volatile float mNcResidual   = 0.0f;  // 0.0 .. 1.0
 	/** Гистерезис: closeThresh = openThresh / mNcHysteresis */
 	private volatile float mNcHysteresis = 2.0f;  // 1.05 .. 4
 	/** Время атаки, мс */
@@ -844,15 +846,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				LinearLayout row = new LinearLayout(this);
 				row.setOrientation(LinearLayout.HORIZONTAL);
 				row.setGravity(Gravity.CENTER_VERTICAL);
-				final TextView tvLbl = smallLabel("Thr:3.0x");
+				final TextView tvLbl = smallLabel("Thr:2.0x");
 				tvLbl.setMinWidth(dp(52));
 				SeekBar sb = new SeekBar(this);
 				sb.setMax(100);
-				sb.setProgress(18);
+				sb.setProgress(11);
 				sb.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 				sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
 					public void onProgressChanged(SeekBar s, int p, boolean u) {
-						mNcThreshMult = 1.5f + p * 0.085f;
+						mNcThreshMult = 1.0f + p * 0.09f;
 						tvLbl.setText(String.format("Thr:%.1fx", mNcThreshMult));
 					}
 					public void onStartTrackingTouch(SeekBar s) {}
@@ -917,6 +919,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					public void onProgressChanged(SeekBar s, int p, boolean u) {
 						mNcReleaseMs = 50 + Math.round(p * 29.5f);
 						tvLbl.setText("Rel:" + mNcReleaseMs + "ms");
+					}
+					public void onStartTrackingTouch(SeekBar s) {}
+					public void onStopTrackingTouch(SeekBar s) {}
+				});
+				row.addView(tvLbl); row.addView(sb);
+				mNcLevelRow.addView(row);
+			}
+			// ── Residual (экспандер) ─────────────────────────────────────────
+			{
+				LinearLayout row = new LinearLayout(this);
+				row.setOrientation(LinearLayout.HORIZONTAL);
+				row.setGravity(Gravity.CENTER_VERTICAL);
+				final TextView tvLbl = smallLabel("Res:0%");
+				tvLbl.setMinWidth(dp(52));
+				SeekBar sb = new SeekBar(this);
+				sb.setMax(100);
+				sb.setProgress(0);
+				sb.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+				sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+					public void onProgressChanged(SeekBar s, int p, boolean u) {
+						mNcResidual = p / 100f;
+						tvLbl.setText("Res:" + p + "%");
 					}
 					public void onStartTrackingTouch(SeekBar s) {}
 					public void onStopTrackingTouch(SeekBar s) {}
@@ -1685,17 +1709,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		}
 
 		// ── Применяем gain к буферу с плавной атакой/риливом ─────────────────────
+		final float residual = mNcResidual; // 0=гейт, 1=экспандер без подавления
 		for (int i = 0; i < r; i++) {
 			if (mNcGateOpen) {
 				// Атака: gain быстро растёт к 1
-				mNcGateGain += (1f - mNcGateGain) * (1f - attackPerFrame);
+				mNcGateGain += (1f - mNcGateGain) * attackPerFrame;
 				if (mNcGateGain > 1f) mNcGateGain = 1f;
 			} else {
-				// Рилив: gain экспоненциально убывает (per-sample)
-				// releasePerFrame — коэффициент за весь фрейм;
-				// per-sample: pow(releasePerFrame, 1/r)
-				mNcGateGain *= releasePerFrame;   // приближение достаточна для 20 мс
-				if (mNcGateGain < 0.0001f) mNcGateGain = 0.0001f;
+				// Рилив: gain экспоненциально убывает к residual
+				mNcGateGain = residual + (mNcGateGain - residual) * releasePerFrame;
+				if (mNcGateGain < residual) mNcGateGain = residual;
 			}
 			float s = buf[i] * mNcGateGain;
 			buf[i] = (short)(s > 32767f ? 32767f : (s < -32768f ? -32768f : s));
@@ -1741,24 +1764,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			}
 
 			// ── Custom NC: DSP-шумоподавление по оценке шумового пола ────────
+			// ── WAV sidecar: пишем сырой PCM (до NC) ────────────────────────
+			if (mRecordWav) {
+				handlePcmForWav(buf, r, startUs + totalFrames * 1_000_000L / AUDIO_SR);
+			}
+
+			// ── Custom NC (модифицирует buf in-place) ────────────────────────
 			if (mCustomNcEnabled) applyCustomNc(buf, r);
 
 			float peakAmp = 0f;
 			for (int i = 0; i < r; i++) { float a = Math.abs(buf[i]) / 32768f; if (a > peakAmp) peakAmp = a; }
 			mVu.setPeak(peakAmp);
-			// RMS считаем из post-NC буфера (sumSq был вычислен до гейта)
 			long sumSqPost = 0;
 			for (int _i = 0; _i < r; _i++) sumSqPost += (long) buf[_i] * buf[_i];
 			mVu.setLevel((float) Math.sqrt((double) sumSqPost / r) / 32768f);
 			if (mOscilloscope != null) mOscilloscope.pushSamples(buf, r, ch);
 			if (mEnvelope     != null) mEnvelope.pushSamples(buf, r, ch);
 			if (mSpectrum     != null) mSpectrum.pushSamples(buf, r, ch);
-
-			// ── WAV sidecar: кольцо / сброс / прямая запись (параллельно AAC) ──
-			// pts вычисляем ДО totalFrames += r/ch — тот же PTS, что уйдёт в AAC.
-			if (mRecordWav) {
-				handlePcmForWav(buf, r, startUs + totalFrames * 1_000_000L / AUDIO_SR);
-			}
 
 			// ── кодируем PCM→AAC ──────────────────────────────────────────────
 			MediaCodec enc = mAudEnc;
