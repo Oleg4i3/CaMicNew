@@ -183,14 +183,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	/** true — кастомное шумоподавление включено (обрабатывается в audioMainLoop) */
 	private volatile boolean mCustomNcEnabled = false;
 	// ─── Поля гейта с гистерезисом ───────────────────────────────────────────
-	/** Скользящий RMS для оценки уровня сигнала (сглаживание ~5 мс) */
-	private float mNcRmsEst   = 0f;
-	/** Скользящий минимум RMS — оценка шумового пола */
-	private float mNcFloorEst = 0f;
-	/** Текущий gain гейта (0..1); плавно меняется attack/release */
-	private float mNcGateGain = 1f;
-	/** true — гейт открыт (сигнал выше порога открытия) */
+	private float mNcRmsEst   = 0f;   // скользящий RMS (~5 мс)
+	private float mNcFloorEst = 0f;   // оценка шумового пола
+	private float mNcGateGain = 1f;   // текущий gain гейта
 	private boolean mNcGateOpen = true;
+	// ── Открытые параметры гейта (регулируются слайдерами) ───────────────────
+	/** Множитель порога открытия: openThresh = floor × mNcThreshMult */
+	private volatile float mNcThreshMult = 3.0f;  // 1.5 .. 10
+	/** Гистерезис: closeThresh = openThresh / mNcHysteresis */
+	private volatile float mNcHysteresis = 2.0f;  // 1.05 .. 4
+	/** Время атаки, мс */
+	private volatile int   mNcAttackMs   = 30;    // 5 .. 300
+	/** Время рилива, мс */
+	private volatile int   mNcReleaseMs  = 600;   // 50 .. 3000
 	private CheckBox mCbCustomNc;
 
 	// ─── Аудио-источники ──────────────────────────────────────────────────────
@@ -740,7 +745,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		LinearLayout bpsRow = new LinearLayout(this);
 		bpsRow.setOrientation(LinearLayout.HORIZONTAL); bpsRow.setGravity(Gravity.CENTER_VERTICAL);
 		bpsRow.addView(smallLabel("Bps: ")); bpsRow.addView(spBps);
-		settingsCol2.addView(smallLabel("Bitrate:"));
 		settingsCol2.addView(bpsRow);
 
 		// ── Выбор разрешения ────────────────────────────────────────────────
@@ -771,8 +775,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		});
 		LinearLayout resRow = new LinearLayout(this);
 		resRow.setOrientation(LinearLayout.HORIZONTAL); resRow.setGravity(Gravity.CENTER_VERTICAL);
-		resRow.addView(spRes);
-		settingsCol2.addView(smallLabel("Resolution:"));
+		resRow.addView(smallLabel("Res: ")); resRow.addView(spRes);
 		settingsCol2.addView(resRow);
 
 		// ── AGC / NC (проверяем доступность статически) ──────────────────────
@@ -823,7 +826,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			mCbCustomNc.setChecked(false);
 			mCbCustomNc.setOnCheckedChangeListener((cb, on) -> {
 				mCustomNcEnabled = on;
-				if (on) { mNcRmsEst = 0f; mNcFloorEst = 0f; mNcGateGain = 1f; mNcGateOpen = true; } // сброс гейта
+				if (on) { mNcRmsEst = 0f; mNcFloorEst = 0f; mNcGateGain = 1f; mNcGateOpen = true; }
 				if (mNcLevelRow != null)
 					mNcLevelRow.setVisibility((on || mNcEnabled) ? View.VISIBLE : View.GONE);
 				updateNcLevelLabel();
@@ -832,31 +835,95 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
 			settingsCol2.addView(fxRow);
 
-			// ── Общий слайдер агрессивности (NC / Custom NC) ────────────────
+			// ── Параметры Custom NC gate (4 слайдера) ───────────────────────
 			mNcLevelRow = new LinearLayout(this);
-			mNcLevelRow.setOrientation(LinearLayout.HORIZONTAL);
-			mNcLevelRow.setGravity(Gravity.CENTER_VERTICAL);
+			mNcLevelRow.setOrientation(LinearLayout.VERTICAL);
 			mNcLevelRow.setVisibility(View.GONE);
 
-			mTvNcLevel = smallLabel("NC agg:2");
-			SeekBar sbNcLvl = new SeekBar(this);
-			sbNcLvl.setMax(100);
-			sbNcLvl.setProgress(20);
-			{ LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
-				0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-			sbNcLvl.setLayoutParams(slp); }
-			sbNcLvl.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-				public void onProgressChanged(SeekBar s, int p, boolean u) {
-					mNcLevel = p;
-					updateNcLevelLabel();
-					if (mNcEnabled) applyAudioEffects();
-					// Custom NC читает mNcLevel напрямую из потока
-				}
-				public void onStartTrackingTouch(SeekBar s) {}
-				public void onStopTrackingTouch(SeekBar s) {}
-			});
-			mNcLevelRow.addView(mTvNcLevel);
-			mNcLevelRow.addView(sbNcLvl);
+			{
+				LinearLayout row = new LinearLayout(this);
+				row.setOrientation(LinearLayout.HORIZONTAL);
+				row.setGravity(Gravity.CENTER_VERTICAL);
+				final TextView tvLbl = smallLabel("Thr:3.0x");
+				tvLbl.setMinWidth(dp(52));
+				SeekBar sb = new SeekBar(this);
+				sb.setMax(100);
+				sb.setProgress(18);
+				sb.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+				sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+					public void onProgressChanged(SeekBar s, int p, boolean u) {
+						mNcThreshMult = 1.5f + p * 0.085f;
+						tvLbl.setText(String.format("Thr:%.1fx", mNcThreshMult));
+					}
+					public void onStartTrackingTouch(SeekBar s) {}
+					public void onStopTrackingTouch(SeekBar s) {}
+				});
+				row.addView(tvLbl); row.addView(sb);
+				mNcLevelRow.addView(row);
+			}
+			{
+				LinearLayout row = new LinearLayout(this);
+				row.setOrientation(LinearLayout.HORIZONTAL);
+				row.setGravity(Gravity.CENTER_VERTICAL);
+				final TextView tvLbl = smallLabel("Hyst:2.0");
+				tvLbl.setMinWidth(dp(52));
+				SeekBar sb = new SeekBar(this);
+				sb.setMax(100);
+				sb.setProgress(32);
+				sb.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+				sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+					public void onProgressChanged(SeekBar s, int p, boolean u) {
+						mNcHysteresis = 1.05f + p * 0.0295f;
+						tvLbl.setText(String.format("Hyst:%.1f", mNcHysteresis));
+					}
+					public void onStartTrackingTouch(SeekBar s) {}
+					public void onStopTrackingTouch(SeekBar s) {}
+				});
+				row.addView(tvLbl); row.addView(sb);
+				mNcLevelRow.addView(row);
+			}
+			{
+				LinearLayout row = new LinearLayout(this);
+				row.setOrientation(LinearLayout.HORIZONTAL);
+				row.setGravity(Gravity.CENTER_VERTICAL);
+				final TextView tvLbl = smallLabel("Atk:30ms");
+				tvLbl.setMinWidth(dp(52));
+				SeekBar sb = new SeekBar(this);
+				sb.setMax(100);
+				sb.setProgress(8);
+				sb.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+				sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+					public void onProgressChanged(SeekBar s, int p, boolean u) {
+						mNcAttackMs = 5 + Math.round(p * 2.95f);
+						tvLbl.setText("Atk:" + mNcAttackMs + "ms");
+					}
+					public void onStartTrackingTouch(SeekBar s) {}
+					public void onStopTrackingTouch(SeekBar s) {}
+				});
+				row.addView(tvLbl); row.addView(sb);
+				mNcLevelRow.addView(row);
+			}
+			{
+				LinearLayout row = new LinearLayout(this);
+				row.setOrientation(LinearLayout.HORIZONTAL);
+				row.setGravity(Gravity.CENTER_VERTICAL);
+				final TextView tvLbl = smallLabel("Rel:600ms");
+				tvLbl.setMinWidth(dp(52));
+				SeekBar sb = new SeekBar(this);
+				sb.setMax(100);
+				sb.setProgress(19);
+				sb.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+				sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+					public void onProgressChanged(SeekBar s, int p, boolean u) {
+						mNcReleaseMs = 50 + Math.round(p * 29.5f);
+						tvLbl.setText("Rel:" + mNcReleaseMs + "ms");
+					}
+					public void onStartTrackingTouch(SeekBar s) {}
+					public void onStopTrackingTouch(SeekBar s) {}
+				});
+				row.addView(tvLbl); row.addView(sb);
+				mNcLevelRow.addView(row);
+			}
 			settingsCol2.addView(mNcLevelRow);
 		}
 		// ────────────────────────────────────────────────────────────────────
@@ -1551,12 +1618,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	 * какой NC активен: системный, кастомный или оба.
 	 */
 	private void updateNcLevelLabel() {
-		if (mTvNcLevel == null) return;
-		String mode;
-		if (mNcEnabled && mCustomNcEnabled) mode = "NC+Cust:";
-		else if (mCustomNcEnabled)           mode = "Cust:";
-		else                                 mode = "NC agg:";
-		runOnUiThread(() -> mTvNcLevel.setText(mode + mNcLevel));
+		// Метки обновляются каждым слайдером индивидуально; здесь ничего не нужно.
 	}
 
 	/**
@@ -1583,22 +1645,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		// Гистерезис: open_thresh > close_thresh — предотвращает дребезг
 		// на экспоненциальных хвостах струнных нот.
 		//
-		final float agg = mNcLevel / 100f;          // 0..1
-
-		// ── Временны́е константы (пересчёт на 20-мс фрейм) ──────────────────────
-		// Атака: ~2 мс (одна итерация ~= 20 мс фрейм, но gain применяется
-		// per-sample, поэтому считаем коэффициент на весь фрейм)
-		final float attackPerFrame  = 0.92f;         // gain растёт до 1 за ~3 фрейма
-		// Рилив: от 800 мс (agg=0) до 80 мс (agg=1)
-		// releaseCoef = exp(-dt / tau),  dt=20ms
-		double tauMs    = 800.0 - agg * 720.0;      // 800..80 мс
-		final float releasePerFrame = (float) Math.exp(-20.0 / tauMs);
-
-		// ── Пороги относительно шумового пола ───────────────────────────────────
-		// При agg=0: openMult=1.8, closeMult=1.2  (мягко, большая зона гистерезиса)
-		// При agg=1: openMult=5.0, closeMult=2.5  (агрессивно)
-		final float openMult  = 1.8f + agg * 3.2f;  // 1.8..5.0
-		final float closeMult = 1.2f + agg * 1.3f;  // 1.2..2.5
+		// ── Параметры гейта из слайдеров ────────────────────────────────────────
+		// dt = 20 мс (один вызов = один 20-мс фрейм AudioRecord)
+		final float openMult  = mNcThreshMult;
+		final float closeMult = mNcThreshMult / mNcHysteresis;
+		// Attack: доля пути от текущего gain к 1 за один фрейм
+		//   gain += (1-gain) * (1 - exp(-20/attackMs))
+		final float attackPerFrame  = 1f - (float) Math.exp(-20.0 / mNcAttackMs);
+		// Release: экспоненциальный коэффициент за один фрейм
+		final float releasePerFrame = (float) Math.exp(-20.0 / mNcReleaseMs);
 
 		// ── Сглаживание RMS (tau ≈ 5 мс) ────────────────────────────────────────
 		long sumSq = 0;
@@ -1691,7 +1746,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			float peakAmp = 0f;
 			for (int i = 0; i < r; i++) { float a = Math.abs(buf[i]) / 32768f; if (a > peakAmp) peakAmp = a; }
 			mVu.setPeak(peakAmp);
-			mVu.setLevel((float) Math.sqrt((double) sumSq / r) / 32768f);
+			// RMS считаем из post-NC буфера (sumSq был вычислен до гейта)
+			long sumSqPost = 0;
+			for (int _i = 0; _i < r; _i++) sumSqPost += (long) buf[_i] * buf[_i];
+			mVu.setLevel((float) Math.sqrt((double) sumSqPost / r) / 32768f);
 			if (mOscilloscope != null) mOscilloscope.pushSamples(buf, r, ch);
 			if (mEnvelope     != null) mEnvelope.pushSamples(buf, r, ch);
 			if (mSpectrum     != null) mSpectrum.pushSamples(buf, r, ch);
