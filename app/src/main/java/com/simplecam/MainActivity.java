@@ -182,8 +182,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	// ─── Custom NC (DSP-шумоподавление в PCM-потоке) ──────────────────────────
 	/** true — кастомное шумоподавление включено (обрабатывается в audioMainLoop) */
 	private volatile boolean mCustomNcEnabled = false;
-	/** Скользящая оценка шумового пола (RMS) для кастомного NC */
-	private float mNoiseFloorEst = 0f;
+	// ─── Поля спектральной субтракции ────────────────────────────────────────
+	private static final int NC_FFT = 1024;            // размер FFT для NC
+	private static final int NC_HALF = NC_FFT / 2;
+	private final float[] mNcRe   = new float[NC_FFT]; // рабочие массивы FFT
+	private final float[] mNcIm   = new float[NC_FFT];
+	private final float[] mNcWin  = new float[NC_FFT]; // окно Ханна
+	/** Per-bin оценка шумового спектра (амплитуды) */
+	private final float[] mNcNoise = new float[NC_HALF];
+	private boolean mNcWinReady = false;               // окно инициализировано
 	private CheckBox mCbCustomNc;
 
 	// ─── Аудио-источники ──────────────────────────────────────────────────────
@@ -816,7 +823,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			mCbCustomNc.setChecked(false);
 			mCbCustomNc.setOnCheckedChangeListener((cb, on) -> {
 				mCustomNcEnabled = on;
-				if (on) mNoiseFloorEst = 0f; // сброс оценки шума при включении
+				if (on) java.util.Arrays.fill(mNcNoise, 0f); // сброс оценки шума
 				if (mNcLevelRow != null)
 					mNcLevelRow.setVisibility((on || mNcEnabled) ? View.VISIBLE : View.GONE);
 				updateNcLevelLabel();
@@ -1564,47 +1571,111 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	 * @param r      число сэмплов (не байт)
 	 */
 	private void applyCustomNc(short[] buf, int r) {
-		// Параметры по агрессивности 0..3
-		final int agg = mNcLevel; // 0=мягко, 3=агрессивно
-		// Скорость обновления шумового пола (вниз быстрее, вверх медленнее)
-		final float alphaDown = 0.08f + agg * 0.04f;
-		final float alphaUp   = 0.005f + agg * 0.003f;
-		// Порог SNR: при SNR ниже этого — подавляем
-		final float threshold  = 2.0f + agg * 1.0f; // 2..5
-		// Остаточный уровень сигнала в подавляемой зоне (0=тишина, 1=без изменений)
-		final float residual   = 0.07f - agg * 0.015f; // 0.07..0.025
+		// ── Параметры агрессивности 0..3 ─────────────────────────────────────────
+		final int   agg      = mNcLevel;
+		// Коэффициент вычитания: 1.0 (мягко) … 2.5 (агрессивно)
+		final float overdraw = 1.0f + agg * 0.5f;
+		// Спектральный пол: сигнал не может быть подавлен ниже этого уровня (3%..1%)
+		final float beta     = 0.03f - agg * 0.005f;
+		// Скорость обновления оценки шума (быстро снижается, медленно растёт)
+		final float alphaDown = 0.15f + agg * 0.05f; // 0.15..0.30
+		final float alphaUp   = 0.005f;
 
-		// Считаем RMS фрейма
-		long sumSqLocal = 0;
-		for (int i = 0; i < r; i++) sumSqLocal += (long) buf[i] * buf[i];
-		float frameRms = (float) Math.sqrt((double) sumSqLocal / r);
-
-		// Обновляем оценку шумового пола
-		if (mNoiseFloorEst < 1f) {
-			mNoiseFloorEst = frameRms; // первая инициализация
-		} else if (frameRms < mNoiseFloorEst) {
-			mNoiseFloorEst = mNoiseFloorEst * (1f - alphaDown) + frameRms * alphaDown;
-		} else {
-			mNoiseFloorEst = mNoiseFloorEst * (1f - alphaUp) + frameRms * alphaUp;
-		}
-		if (mNoiseFloorEst < 1f) mNoiseFloorEst = 1f;
-
-		// SNR и soft-knee gate
-		float snr = frameRms / mNoiseFloorEst;
-		float gain;
-		if (snr >= threshold) {
-			gain = 1f; // речь/музыка — не трогаем
-		} else {
-			// Мягкое подавление: t=0 при snr=0, t=1 при snr=threshold
-			float t = snr / threshold;
-			gain = residual + (1f - residual) * t * t; // квадратичное knee
+		// ── Инициализация окна Ханна (один раз) ──────────────────────────────────
+		if (!mNcWinReady) {
+			for (int i = 0; i < NC_FFT; i++)
+				mNcWin[i] = 0.5f * (1f - (float) Math.cos(2.0 * Math.PI * i / (NC_FFT - 1)));
+			mNcWinReady = true;
 		}
 
-		// Применяем gain к буферу
-		if (gain < 1f) {
-			for (int i = 0; i < r; i++) {
-				float s = buf[i] * gain;
-				buf[i] = (short)(s > 32767f ? 32767f : (s < -32768f ? -32768f : s));
+		// ── Канальный микс → mNcRe (mono, zero-pad до NC_FFT) ────────────────────
+		// buf может быть стерео (interleaved); берём среднее каналов
+		int channels = (r > 0 && mAudChannels > 0) ? mAudChannels : 1;
+		int frames   = r / channels; // число аудио-фреймов в буфере
+		for (int f = 0; f < NC_FFT; f++) {
+			if (f < frames) {
+				float sum = 0f;
+				for (int c = 0; c < channels; c++) sum += buf[f * channels + c];
+				mNcRe[f] = (sum / channels) * mNcWin[f];
+			} else {
+				mNcRe[f] = 0f; // zero-pad
+			}
+			mNcIm[f] = 0f;
+		}
+
+		// ── Прямое FFT (Cooley-Tukey radix-2 DIT) ────────────────────────────────
+		ncFft(mNcRe, mNcIm, false);
+
+		// ── Обновление шумового спектра и спектральная субтракция ────────────────
+		for (int k = 0; k < NC_HALF; k++) {
+			float mag = (float) Math.sqrt(mNcRe[k]*mNcRe[k] + mNcIm[k]*mNcIm[k]);
+			// Обновляем оценку шума: при первом вызове (0) — инициализируем
+			if (mNcNoise[k] == 0f) {
+				mNcNoise[k] = mag;
+			} else if (mag < mNcNoise[k]) {
+				mNcNoise[k] = mNcNoise[k] * (1f - alphaDown) + mag * alphaDown;
+			} else {
+				mNcNoise[k] = mNcNoise[k] * (1f - alphaUp)   + mag * alphaUp;
+			}
+			// Gain по Berouti: g = max(1 - overdraw * noise/mag, beta)
+			float g = (mag > 1e-9f) ? (1f - overdraw * mNcNoise[k] / mag) : 0f;
+			if (g < beta) g = beta;
+			// Применяем gain к комплексному бину
+			mNcRe[k] *= g;
+			mNcIm[k] *= g;
+			// Зеркальная половина (сопряжённая симметрия для вещественного сигнала)
+			if (k > 0 && k < NC_HALF) {
+				mNcRe[NC_FFT - k] *= g;
+				mNcIm[NC_FFT - k] *= g;
+			}
+		}
+
+		// ── Обратное FFT (IFFT = прямой FFT с инверсией Im → делим на N) ─────────
+		ncFft(mNcRe, mNcIm, true);
+
+		// ── Записываем обратно в buf (все каналы одинаково) ──────────────────────
+		for (int f = 0; f < frames; f++) {
+			float s = mNcRe[f] / NC_FFT;           // нормировка IFFT
+			// Компенсируем энергетические потери окна Ханна (×2)
+			s *= 2f;
+			short sv = (short)(s >  32767f ?  32767f : (s < -32768f ? -32768f : s));
+			for (int c = 0; c < channels; c++) buf[f * channels + c] = sv;
+		}
+	}
+
+	/**
+	 * Cooley-Tukey radix-2 DIT FFT/IFFT in-place.
+	 * @param re  вещественная часть (NC_FFT элементов)
+	 * @param im  мнимая часть      (NC_FFT элементов)
+	 * @param inv true → IFFT (инвертируем знак Im), нормировку делает вызывающий
+	 */
+	private static void ncFft(float[] re, float[] im, boolean inv) {
+		final int n = NC_FFT;
+		// Bit-reversal permutation
+		for (int i = 1, j = 0; i < n; i++) {
+			int bit = n >> 1;
+			for (; (j & bit) != 0; bit >>= 1) j ^= bit;
+			j ^= bit;
+			if (i < j) {
+				float t; t = re[i]; re[i] = re[j]; re[j] = t;
+				t = im[i]; im[i] = im[j]; im[j] = t;
+			}
+		}
+		// Butterfly stages
+		for (int len = 2; len <= n; len <<= 1) {
+			double ang = 2.0 * Math.PI / len * (inv ? 1 : -1);
+			float wRe = (float) Math.cos(ang), wIm = (float) Math.sin(ang);
+			for (int i = 0; i < n; i += len) {
+				float curRe = 1f, curIm = 0f;
+				for (int k = 0; k < len / 2; k++) {
+					float uRe = re[i+k], uIm = im[i+k];
+					float vRe = re[i+k+len/2]*curRe - im[i+k+len/2]*curIm;
+					float vIm = re[i+k+len/2]*curIm + im[i+k+len/2]*curRe;
+					re[i+k]        = uRe+vRe; im[i+k]        = uIm+vIm;
+					re[i+k+len/2]  = uRe-vRe; im[i+k+len/2]  = uIm-vIm;
+					float nRe = curRe*wRe - curIm*wIm;
+					curIm = curRe*wIm + curIm*wRe; curRe = nRe;
+				}
 			}
 		}
 	}
