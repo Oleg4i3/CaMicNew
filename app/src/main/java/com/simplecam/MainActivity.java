@@ -192,12 +192,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private volatile float mNcThreshMult = 2.0f;  // 1.0 .. 10
 	/** Остаточный gain когда гейт закрыт: 0=тишина, 1=без подавления (экспандер) */
 	private volatile float mNcResidual   = 0.0f;  // 0.0 .. 1.0
-	/** Гистерезис: closeThresh = openThresh / mNcHysteresis */
-	private volatile float mNcHysteresis = 2.0f;  // 1.05 .. 4
-	/** Время атаки, мс */
-	private volatile int   mNcAttackMs   = 30;    // 5 .. 300
+	/** Гистерезис в дБ: closeThresh = openThresh × 10^(mNcHystDb/20) */
+	private volatile float mNcHystDb     = -6.0f; // -12 .. 0 dB
 	/** Время рилива, мс */
 	private volatile int   mNcReleaseMs  = 600;   // 50 .. 3000
+	// ── Lookahead: очередь delayed PCM-чанков ────────────────────────────────
+	private static final int NC_LOOKAHEAD_MS = 30; // мс опережения
+	private final java.util.ArrayDeque<short[]> mNcDelayQ = new java.util.ArrayDeque<>();
+	private int mNcDelayedSamples = 0;             // сэмплов в очереди
 	private CheckBox mCbCustomNc;
 
 	// ─── Аудио-источники ──────────────────────────────────────────────────────
@@ -746,23 +748,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		});
 		LinearLayout bpsRow = new LinearLayout(this);
 		bpsRow.setOrientation(LinearLayout.HORIZONTAL); bpsRow.setGravity(Gravity.CENTER_VERTICAL);
-		bpsRow.addView(smallLabel("Bps: ")); bpsRow.addView(spBps);
-		settingsCol2.addView(bpsRow);
-
-		// ── Выбор разрешения ────────────────────────────────────────────────
-		String[] resL = {"HD  1280×720", "Full HD  1920×1080"};
+		// ── Bps + Res в одной строке ─────────────────────────────────────────
+		String[] resL = {"HD 720p", "FHD 1080p"};
 		Spinner spRes = new Spinner(this);
 		ArrayAdapter<String> resAd = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, resL);
 		resAd.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-		spRes.setAdapter(resAd); spRes.setSelection(1); // Full HD по умолчанию
+		spRes.setAdapter(resAd); spRes.setSelection(1);
 		spRes.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
 			public void onItemSelected(AdapterView<?> p, View v, int pos, long id) {
 				int newW = (pos == 0) ? 1280 : 1920;
 				int newH = (pos == 0) ? 720  : 1080;
-				if (newW == mVideoW && newH == mVideoH) return; // без изменений
-				if (mRecording) return;                         // во время записи не трогаем
+				if (newW == mVideoW && newH == mVideoH) return;
+				if (mRecording) return;
 				mVideoW = newW; mVideoH = newH;
-				// Пересоздаём энкодер с новым разрешением и перезапускаем capture session
 				if (mVidEnc != null) {
 					try { mVidEnc.stop(); mVidEnc.release(); } catch (Exception ignored) {}
 					mVidEnc = null;
@@ -775,10 +773,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			}
 			public void onNothingSelected(AdapterView<?> p) {}
 		});
-		LinearLayout resRow = new LinearLayout(this);
-		resRow.setOrientation(LinearLayout.HORIZONTAL); resRow.setGravity(Gravity.CENTER_VERTICAL);
-		resRow.addView(smallLabel("Res: ")); resRow.addView(spRes);
-		settingsCol2.addView(resRow);
+		// Одна строка: [Bps: <spinner>]  [Res: <spinner>]
+		LinearLayout spinRow = new LinearLayout(this);
+		spinRow.setOrientation(LinearLayout.HORIZONTAL);
+		spinRow.setGravity(Gravity.CENTER_VERTICAL);
+		spBps.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+		spRes.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+		spinRow.addView(smallLabel("Bps:")); spinRow.addView(spBps);
+		spinRow.addView(smallLabel(" Res:")); spinRow.addView(spRes);
+		settingsCol2.addView(spinRow);
 
 		// ── AGC / NC (проверяем доступность статически) ──────────────────────
 		mAgcAvailable = AutomaticGainControl.isAvailable();
@@ -826,7 +829,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			mCbCustomNc.setChecked(false);
 			mCbCustomNc.setOnCheckedChangeListener((cb, on) -> {
 				mCustomNcEnabled = on;
-				if (on) { mNcRmsEst = 0f; mNcFloorEst = 0f; mNcGateGain = 1f; mNcGateOpen = true; }
+				if (on) { mNcRmsEst=0f; mNcFloorEst=0f; mNcGateGain=1f; mNcGateOpen=true; mNcDelayQ.clear(); mNcDelayedSamples=0; }
 				if (mNcLevelRow != null)
 					mNcLevelRow.setVisibility((on || mNcEnabled) ? View.VISIBLE : View.GONE);
 				updateNcLevelLabel();
@@ -865,37 +868,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				LinearLayout row = new LinearLayout(this);
 				row.setOrientation(LinearLayout.HORIZONTAL);
 				row.setGravity(Gravity.CENTER_VERTICAL);
-				final TextView tvLbl = smallLabel("Hyst:2.0");
+				final TextView tvLbl = smallLabel("Hyst:-6dB");
 				tvLbl.setMinWidth(dp(52));
 				SeekBar sb = new SeekBar(this);
-				sb.setMax(100);
-				sb.setProgress(32);
+				sb.setMax(120);
+				sb.setProgress(60);
 				sb.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 				sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
 					public void onProgressChanged(SeekBar s, int p, boolean u) {
-						mNcHysteresis = 1.05f + p * 0.0295f;
-						tvLbl.setText(String.format("Hyst:%.1f", mNcHysteresis));
-					}
-					public void onStartTrackingTouch(SeekBar s) {}
-					public void onStopTrackingTouch(SeekBar s) {}
-				});
-				row.addView(tvLbl); row.addView(sb);
-				mNcLevelRow.addView(row);
-			}
-			{
-				LinearLayout row = new LinearLayout(this);
-				row.setOrientation(LinearLayout.HORIZONTAL);
-				row.setGravity(Gravity.CENTER_VERTICAL);
-				final TextView tvLbl = smallLabel("Atk:30ms");
-				tvLbl.setMinWidth(dp(52));
-				SeekBar sb = new SeekBar(this);
-				sb.setMax(100);
-				sb.setProgress(8);
-				sb.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-				sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-					public void onProgressChanged(SeekBar s, int p, boolean u) {
-						mNcAttackMs = 5 + Math.round(p * 2.95f);
-						tvLbl.setText("Atk:" + mNcAttackMs + "ms");
+						mNcHystDb = -12f + p * 0.1f;
+						tvLbl.setText(String.format("Hyst:%.0fdB", mNcHystDb));
 					}
 					public void onStartTrackingTouch(SeekBar s) {}
 					public void onStopTrackingTouch(SeekBar s) {}
@@ -953,16 +935,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mAudioSrcPanel.addView(settingsCol1);
 		mAudioSrcPanel.addView(settingsCol2);
 
-		panel.addView(mAudioSrcPanel);
-
-		// ── Строка: спектр-анализатор (слева, weight=1) + кнопка REC (справа) ──
-		// REC справа, с отступом rightMargin=58dp чтобы не перекрыть рычаг зума (54dp)
-		// Спектр — только анализатор, занимает всю ширину нижней панели
+		// ── Спектр всегда виден; настройки накладываются сверху (FrameLayout) ──
 		mSpectrum = new SpectrumView(this);
-		LinearLayout.LayoutParams specLP = new LinearLayout.LayoutParams(
-			ViewGroup.LayoutParams.MATCH_PARENT, dp(72));
-		specLP.rightMargin = dp(120); // не заходить под кнопки REC+PAUSE
-		panel.addView(mSpectrum, specLP);
+		android.widget.FrameLayout specFrame = new android.widget.FrameLayout(this);
+		// Спектр — базовый слой (снизу)
+		android.widget.FrameLayout.LayoutParams specFLP =
+			new android.widget.FrameLayout.LayoutParams(
+				ViewGroup.LayoutParams.MATCH_PARENT, dp(72), Gravity.BOTTOM);
+		specFLP.rightMargin = dp(120);
+		specFrame.addView(mSpectrum, specFLP);
+		// Настройки — поверх (сверху), поэтому addView после спектра
+		specFrame.addView(mAudioSrcPanel, new android.widget.FrameLayout.LayoutParams(
+			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+			Gravity.TOP));
+		panel.addView(specFrame);
 
 		// ── REC и PAUSE фиксированы в root (FrameLayout), не сдвигаются ──────
 		// REC — большая круглая кнопка, прикреплена к правому нижнему углу
@@ -1667,13 +1653,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		// Гистерезис: open_thresh > close_thresh — предотвращает дребезг
 		// на экспоненциальных хвостах струнных нот.
 		//
-		// ── Параметры гейта из слайдеров ────────────────────────────────────────
-		// dt = 20 мс (один вызов = один 20-мс фрейм AudioRecord)
+		// ── Lookahead: задерживаем сигнал на NC_LOOKAHEAD_MS мс ─────────────────
+		// Копируем текущий сырой буфер в очередь задержки
+		short[] rawCopy = java.util.Arrays.copyOf(buf, r);
+		mNcDelayQ.add(rawCopy);
+		mNcDelayedSamples += r;
+
+		// ── Параметры гейта ───────────────────────────────────────────────────
 		final float openMult  = mNcThreshMult;
-		final float closeMult = mNcThreshMult / mNcHysteresis;
-		// Attack: доля пути от текущего gain к 1 за один фрейм
-		//   gain += (1-gain) * (1 - exp(-20/attackMs))
-		final float attackPerFrame  = 1f - (float) Math.exp(-20.0 / mNcAttackMs);
+		// Гистерезис в дБ: closeThresh = openThresh × 10^(dB/20)
+		final float hystLinear = (float) Math.pow(10.0, mNcHystDb / 20.0); // <1
+		final float closeMult = openMult * hystLinear;
+		// Атака хардкодом: tau=0.5ms → ~99% за 2.3ms (психоакустически гладко)
+		// per-sample коэффициент: 1 - exp(-1/(SR*0.0005))
+		final float ATK_PER_SAMPLE = 1f - (float) Math.exp(-1.0 / (AUDIO_SR * 0.0005));
 		// Release: экспоненциальный коэффициент за один фрейм
 		final float releasePerFrame = (float) Math.exp(-20.0 / mNcReleaseMs);
 
@@ -1707,18 +1700,36 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		}
 
 		// ── Применяем gain к буферу с плавной атакой/риливом ─────────────────────
-		final float residual = mNcResidual; // 0=гейт, 1=экспандер без подавления
-		for (int i = 0; i < r; i++) {
+		// ── Применяем gain к ЗАДЕРЖАННОМУ сигналу (lookahead) ───────────────────
+		// Достаточно ли накоплено?
+		int lookaheadSamples = NC_LOOKAHEAD_MS * AUDIO_SR / 1000;
+		short[] outBuf;
+		if (mNcDelayedSamples >= lookaheadSamples + r) {
+			// Извлекаем самый старый фрейм
+			outBuf = mNcDelayQ.poll();
+			mNcDelayedSamples -= (outBuf != null ? outBuf.length : r);
+		} else {
+			// Буфер ещё не заполнен — тишина
+			java.util.Arrays.fill(buf, 0, r, (short) 0);
+			return;
+		}
+		if (outBuf == null) outBuf = new short[r];
+
+		// Применяем gain с логарифмически-плавной атакой (per-sample)
+		final float residual = mNcResidual;
+		int outLen = Math.min(r, outBuf.length);
+		for (int i = 0; i < outLen; i++) {
 			if (mNcGateOpen) {
-				// Атака: gain быстро растёт к 1
-				mNcGateGain += (1f - mNcGateGain) * attackPerFrame;
+				// Атака: экспоненциальное приближение к 1 (tau=0.5ms)
+				// dB/время линейно → психоакустически равномерный нарастание громкости
+				mNcGateGain += (1f - mNcGateGain) * ATK_PER_SAMPLE;
 				if (mNcGateGain > 1f) mNcGateGain = 1f;
 			} else {
-				// Рилив: gain экспоненциально убывает к residual
+				// Рилив к residual
 				mNcGateGain = residual + (mNcGateGain - residual) * releasePerFrame;
 				if (mNcGateGain < residual) mNcGateGain = residual;
 			}
-			float s = buf[i] * mNcGateGain;
+			float s = outBuf[i] * mNcGateGain;
 			buf[i] = (short)(s > 32767f ? 32767f : (s < -32768f ? -32768f : s));
 		}
 	}
@@ -1784,7 +1795,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			MediaCodec enc = mAudEnc;
 			if (enc == null) continue;
 			// PTS: абсолютный System.nanoTime (мкс) — тот же домен, что у видео
-			long pts = startUs + totalFrames * 1_000_000L / AUDIO_SR;
+			long pts = startUs + totalFrames * 1_000_000L / AUDIO_SR
+					- (mCustomNcEnabled ? (long) NC_LOOKAHEAD_MS * 1000L : 0L);
 			totalFrames += r / ch;
 			int idx = enc.dequeueInputBuffer(5_000);
 			if (idx >= 0) {
