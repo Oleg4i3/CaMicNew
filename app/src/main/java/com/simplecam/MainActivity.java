@@ -1667,8 +1667,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		// Атака хардкодом: tau=0.5ms → ~99% за 2.3ms (психоакустически гладко)
 		// per-sample коэффициент: 1 - exp(-1/(SR*0.0005))
 		final float ATK_PER_SAMPLE = 1f - (float) Math.exp(-1.0 / (AUDIO_SR * 0.0005));
-		// Release: экспоненциальный коэффициент за один фрейм
-		final float releasePerFrame = (float) Math.exp(-20.0 / mNcReleaseMs);
+		// Release: per-sample коэффициент (аналогично атаке)
+		// tau = releaseMs/1000 с, dt = 1/AUDIO_SR с → alpha = exp(-dt/tau)
+		final float REL_PER_SAMPLE = (float) Math.exp(-1000.0 / ((double) AUDIO_SR * mNcReleaseMs));
 
 		// ── Сглаживание RMS (tau ≈ 5 мс) ────────────────────────────────────────
 		long sumSq = 0;
@@ -1725,8 +1726,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				mNcGateGain += (1f - mNcGateGain) * ATK_PER_SAMPLE;
 				if (mNcGateGain > 1f) mNcGateGain = 1f;
 			} else {
-				// Рилив к residual
-				mNcGateGain = residual + (mNcGateGain - residual) * releasePerFrame;
+				// Рилив: экспоненциальное затухание к residual (per-sample, tau=releaseMs)
+				mNcGateGain = residual + (mNcGateGain - residual) * REL_PER_SAMPLE;
 				if (mNcGateGain < residual) mNcGateGain = residual;
 			}
 			float s = outBuf[i] * mNcGateGain;
