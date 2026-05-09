@@ -785,8 +785,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mNcAvailable  = NoiseSuppressor.isAvailable();
 
 		if (mAgcAvailable || mNcAvailable) {
-			settingsCol2.addView(smallLabel("Audio FX:"));
-
 			LinearLayout fxRow = new LinearLayout(this);
 			fxRow.setOrientation(LinearLayout.HORIZONTAL);
 			fxRow.setGravity(Gravity.CENTER_VERTICAL);
