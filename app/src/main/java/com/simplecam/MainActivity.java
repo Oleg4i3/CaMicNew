@@ -182,15 +182,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	// ─── Custom NC (DSP-шумоподавление в PCM-потоке) ──────────────────────────
 	/** true — кастомное шумоподавление включено (обрабатывается в audioMainLoop) */
 	private volatile boolean mCustomNcEnabled = false;
-	// ─── Поля спектральной субтракции ────────────────────────────────────────
-	private static final int NC_FFT = 1024;            // размер FFT для NC
-	private static final int NC_HALF = NC_FFT / 2;
-	private final float[] mNcRe   = new float[NC_FFT]; // рабочие массивы FFT
-	private final float[] mNcIm   = new float[NC_FFT];
-	private final float[] mNcWin  = new float[NC_FFT]; // окно Ханна
-	/** Per-bin оценка шумового спектра (амплитуды) */
-	private final float[] mNcNoise = new float[NC_HALF];
-	private boolean mNcWinReady = false;               // окно инициализировано
+	// ─── Поля гейта с гистерезисом ───────────────────────────────────────────
+	/** Скользящий RMS для оценки уровня сигнала (сглаживание ~5 мс) */
+	private float mNcRmsEst   = 0f;
+	/** Скользящий минимум RMS — оценка шумового пола */
+	private float mNcFloorEst = 0f;
+	/** Текущий gain гейта (0..1); плавно меняется attack/release */
+	private float mNcGateGain = 1f;
+	/** true — гейт открыт (сигнал выше порога открытия) */
+	private boolean mNcGateOpen = true;
 	private CheckBox mCbCustomNc;
 
 	// ─── Аудио-источники ──────────────────────────────────────────────────────
@@ -823,7 +823,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			mCbCustomNc.setChecked(false);
 			mCbCustomNc.setOnCheckedChangeListener((cb, on) -> {
 				mCustomNcEnabled = on;
-				if (on) java.util.Arrays.fill(mNcNoise, 0f); // сброс оценки шума
+				if (on) { mNcRmsEst = 0f; mNcFloorEst = 0f; mNcGateGain = 1f; mNcGateOpen = true; } // сброс гейта
 				if (mNcLevelRow != null)
 					mNcLevelRow.setVisibility((on || mNcEnabled) ? View.VISIBLE : View.GONE);
 				updateNcLevelLabel();
@@ -840,9 +840,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
 			mTvNcLevel = smallLabel("NC agg:2");
 			SeekBar sbNcLvl = new SeekBar(this);
-			sbNcLvl.setMax(3);
-			sbNcLvl.setProgress(2);
-			sbNcLvl.setLayoutParams(new LinearLayout.LayoutParams(dp(80), ViewGroup.LayoutParams.WRAP_CONTENT));
+			sbNcLvl.setMax(100);
+			sbNcLvl.setProgress(20);
+			{ LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
+				0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+			sbNcLvl.setLayoutParams(slp); }
 			sbNcLvl.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
 				public void onProgressChanged(SeekBar s, int p, boolean u) {
 					mNcLevel = p;
@@ -1571,115 +1573,79 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	 * @param r      число сэмплов (не байт)
 	 */
 	private void applyCustomNc(short[] buf, int r) {
-		// ── Параметры агрессивности 0..3 ─────────────────────────────────────────
-		final int   agg      = mNcLevel;
-		// Коэффициент вычитания: 1.0 (мягко) … 2.5 (агрессивно)
-		final float overdraw = 1.0f + agg * 0.5f;
-		// Спектральный пол: сигнал не может быть подавлен ниже этого уровня (3%..1%)
-		final float beta     = 0.03f - agg * 0.005f;
-		// Скорость обновления оценки шума (быстро снижается, медленно растёт)
-		final float alphaDown = 0.15f + agg * 0.05f; // 0.15..0.30
-		final float alphaUp   = 0.005f;
+		//
+		// Noise gate с гистерезисом и экспоненциальными атакой/риливом.
+		//
+		// Параметры, выводимые из слайдера aggression 0..100:
+		//   0  → почти прозрачно: очень мягкий порог, очень долгий рилив
+		//   100 → агрессивно: высокий порог, быстрый рилив
+		//
+		// Гистерезис: open_thresh > close_thresh — предотвращает дребезг
+		// на экспоненциальных хвостах струнных нот.
+		//
+		final float agg = mNcLevel / 100f;          // 0..1
 
-		// ── Инициализация окна Ханна (один раз) ──────────────────────────────────
-		if (!mNcWinReady) {
-			for (int i = 0; i < NC_FFT; i++)
-				mNcWin[i] = 0.5f * (1f - (float) Math.cos(2.0 * Math.PI * i / (NC_FFT - 1)));
-			mNcWinReady = true;
+		// ── Временны́е константы (пересчёт на 20-мс фрейм) ──────────────────────
+		// Атака: ~2 мс (одна итерация ~= 20 мс фрейм, но gain применяется
+		// per-sample, поэтому считаем коэффициент на весь фрейм)
+		final float attackPerFrame  = 0.92f;         // gain растёт до 1 за ~3 фрейма
+		// Рилив: от 800 мс (agg=0) до 80 мс (agg=1)
+		// releaseCoef = exp(-dt / tau),  dt=20ms
+		double tauMs    = 800.0 - agg * 720.0;      // 800..80 мс
+		final float releasePerFrame = (float) Math.exp(-20.0 / tauMs);
+
+		// ── Пороги относительно шумового пола ───────────────────────────────────
+		// При agg=0: openMult=1.8, closeMult=1.2  (мягко, большая зона гистерезиса)
+		// При agg=1: openMult=5.0, closeMult=2.5  (агрессивно)
+		final float openMult  = 1.8f + agg * 3.2f;  // 1.8..5.0
+		final float closeMult = 1.2f + agg * 1.3f;  // 1.2..2.5
+
+		// ── Сглаживание RMS (tau ≈ 5 мс) ────────────────────────────────────────
+		long sumSq = 0;
+		for (int i = 0; i < r; i++) sumSq += (long) buf[i] * buf[i];
+		float frameRms = (float) Math.sqrt((double) sumSq / r);
+
+		// alphaRms ≈ 1 - exp(-20/5) → быстрое сглаживание
+		final float alphaRms = 0.98f;
+		mNcRmsEst = mNcRmsEst * (1f - alphaRms) + frameRms * alphaRms;
+
+		// ── Оценка шумового пола — медленный tracker минимума ────────────────────
+		if (mNcFloorEst < 1f) {
+			mNcFloorEst = frameRms;             // первая инициализация
+		} else if (frameRms < mNcFloorEst) {
+			mNcFloorEst = mNcFloorEst * 0.90f + frameRms * 0.10f; // быстро вниз
+		} else {
+			mNcFloorEst = mNcFloorEst * 0.998f + frameRms * 0.002f; // медленно вверх
+		}
+		if (mNcFloorEst < 1f) mNcFloorEst = 1f;
+
+		// ── Гистерезис: переключение состояния гейта ─────────────────────────────
+		float openThresh  = mNcFloorEst * openMult;
+		float closeThresh = mNcFloorEst * closeMult;
+
+		if (!mNcGateOpen && mNcRmsEst >= openThresh) {
+			mNcGateOpen = true;                 // открываем (быстрая атака)
+		} else if (mNcGateOpen && mNcRmsEst < closeThresh) {
+			mNcGateOpen = false;                // начинаем рилив
 		}
 
-		// ── Канальный микс → mNcRe (mono, zero-pad до NC_FFT) ────────────────────
-		// buf может быть стерео (interleaved); берём среднее каналов
-		int channels = (r > 0 && mAudChannels > 0) ? mAudChannels : 1;
-		int frames   = r / channels; // число аудио-фреймов в буфере
-		for (int f = 0; f < NC_FFT; f++) {
-			if (f < frames) {
-				float sum = 0f;
-				for (int c = 0; c < channels; c++) sum += buf[f * channels + c];
-				mNcRe[f] = (sum / channels) * mNcWin[f];
+		// ── Применяем gain к буферу с плавной атакой/риливом ─────────────────────
+		for (int i = 0; i < r; i++) {
+			if (mNcGateOpen) {
+				// Атака: gain быстро растёт к 1
+				mNcGateGain += (1f - mNcGateGain) * (1f - attackPerFrame);
+				if (mNcGateGain > 1f) mNcGateGain = 1f;
 			} else {
-				mNcRe[f] = 0f; // zero-pad
+				// Рилив: gain экспоненциально убывает (per-sample)
+				// releasePerFrame — коэффициент за весь фрейм;
+				// per-sample: pow(releasePerFrame, 1/r)
+				mNcGateGain *= releasePerFrame;   // приближение достаточна для 20 мс
+				if (mNcGateGain < 0.0001f) mNcGateGain = 0.0001f;
 			}
-			mNcIm[f] = 0f;
-		}
-
-		// ── Прямое FFT (Cooley-Tukey radix-2 DIT) ────────────────────────────────
-		ncFft(mNcRe, mNcIm, false);
-
-		// ── Обновление шумового спектра и спектральная субтракция ────────────────
-		for (int k = 0; k < NC_HALF; k++) {
-			float mag = (float) Math.sqrt(mNcRe[k]*mNcRe[k] + mNcIm[k]*mNcIm[k]);
-			// Обновляем оценку шума: при первом вызове (0) — инициализируем
-			if (mNcNoise[k] == 0f) {
-				mNcNoise[k] = mag;
-			} else if (mag < mNcNoise[k]) {
-				mNcNoise[k] = mNcNoise[k] * (1f - alphaDown) + mag * alphaDown;
-			} else {
-				mNcNoise[k] = mNcNoise[k] * (1f - alphaUp)   + mag * alphaUp;
-			}
-			// Gain по Berouti: g = max(1 - overdraw * noise/mag, beta)
-			float g = (mag > 1e-9f) ? (1f - overdraw * mNcNoise[k] / mag) : 0f;
-			if (g < beta) g = beta;
-			// Применяем gain к комплексному бину
-			mNcRe[k] *= g;
-			mNcIm[k] *= g;
-			// Зеркальная половина (сопряжённая симметрия для вещественного сигнала)
-			if (k > 0 && k < NC_HALF) {
-				mNcRe[NC_FFT - k] *= g;
-				mNcIm[NC_FFT - k] *= g;
-			}
-		}
-
-		// ── Обратное FFT (IFFT = прямой FFT с инверсией Im → делим на N) ─────────
-		ncFft(mNcRe, mNcIm, true);
-
-		// ── Записываем обратно в buf (все каналы одинаково) ──────────────────────
-		for (int f = 0; f < frames; f++) {
-			float s = mNcRe[f] / NC_FFT;           // нормировка IFFT
-			// Компенсируем энергетические потери окна Ханна (×2)
-			s *= 2f;
-			short sv = (short)(s >  32767f ?  32767f : (s < -32768f ? -32768f : s));
-			for (int c = 0; c < channels; c++) buf[f * channels + c] = sv;
+			float s = buf[i] * mNcGateGain;
+			buf[i] = (short)(s > 32767f ? 32767f : (s < -32768f ? -32768f : s));
 		}
 	}
-
-	/**
-	 * Cooley-Tukey radix-2 DIT FFT/IFFT in-place.
-	 * @param re  вещественная часть (NC_FFT элементов)
-	 * @param im  мнимая часть      (NC_FFT элементов)
-	 * @param inv true → IFFT (инвертируем знак Im), нормировку делает вызывающий
-	 */
-	private static void ncFft(float[] re, float[] im, boolean inv) {
-		final int n = NC_FFT;
-		// Bit-reversal permutation
-		for (int i = 1, j = 0; i < n; i++) {
-			int bit = n >> 1;
-			for (; (j & bit) != 0; bit >>= 1) j ^= bit;
-			j ^= bit;
-			if (i < j) {
-				float t; t = re[i]; re[i] = re[j]; re[j] = t;
-				t = im[i]; im[i] = im[j]; im[j] = t;
-			}
-		}
-		// Butterfly stages
-		for (int len = 2; len <= n; len <<= 1) {
-			double ang = 2.0 * Math.PI / len * (inv ? 1 : -1);
-			float wRe = (float) Math.cos(ang), wIm = (float) Math.sin(ang);
-			for (int i = 0; i < n; i += len) {
-				float curRe = 1f, curIm = 0f;
-				for (int k = 0; k < len / 2; k++) {
-					float uRe = re[i+k], uIm = im[i+k];
-					float vRe = re[i+k+len/2]*curRe - im[i+k+len/2]*curIm;
-					float vIm = re[i+k+len/2]*curIm + im[i+k+len/2]*curRe;
-					re[i+k]        = uRe+vRe; im[i+k]        = uIm+vIm;
-					re[i+k+len/2]  = uRe-vRe; im[i+k+len/2]  = uIm-vIm;
-					float nRe = curRe*wRe - curIm*wIm;
-					curIm = curRe*wIm + curIm*wRe; curRe = nRe;
-				}
-			}
-		}
-	}
-
 	/** Применяет текущие настройки к активной AudioRecord сессии (вызов из UI). */
 	private void applyAudioEffects() {
 		AudioRecord rec = mAudRec;
