@@ -179,6 +179,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private LinearLayout mNcLevelRow;            // строка слайдера агрессивности
 	private TextView mTvNcLevel;
 
+	// ─── Custom NC (DSP-шумоподавление в PCM-потоке) ──────────────────────────
+	/** true — кастомное шумоподавление включено (обрабатывается в audioMainLoop) */
+	private volatile boolean mCustomNcEnabled = false;
+	/** Скользящая оценка шумового пола (RMS) для кастомного NC */
+	private float mNoiseFloorEst = 0f;
+	private CheckBox mCbCustomNc;
+
 	// ─── Аудио-источники ──────────────────────────────────────────────────────
 	private final List<AudioSrcItem> mSrcList = new ArrayList<>();
 
@@ -794,38 +801,54 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				mCbNc.setOnCheckedChangeListener((cb, on) -> {
 					mNcEnabled = on;
 					if (mNcLevelRow != null)
-						mNcLevelRow.setVisibility(on ? View.VISIBLE : View.GONE);
+						mNcLevelRow.setVisibility((on || mCustomNcEnabled) ? View.VISIBLE : View.GONE);
+					updateNcLevelLabel();
 					applyAudioEffects();
 				});
 				fxRow.addView(mCbNc);
 			}
+
+			// ── Custom NC: DSP-шумоподавление, работает всегда ───────────────
+			mCbCustomNc = new CheckBox(this);
+			mCbCustomNc.setText("Cust.NC");
+			mCbCustomNc.setTextColor(0xCCCCCCCC);
+			mCbCustomNc.setTextSize(12);
+			mCbCustomNc.setChecked(false);
+			mCbCustomNc.setOnCheckedChangeListener((cb, on) -> {
+				mCustomNcEnabled = on;
+				if (on) mNoiseFloorEst = 0f; // сброс оценки шума при включении
+				if (mNcLevelRow != null)
+					mNcLevelRow.setVisibility((on || mNcEnabled) ? View.VISIBLE : View.GONE);
+				updateNcLevelLabel();
+			});
+			fxRow.addView(mCbCustomNc);
+
 			settingsCol2.addView(fxRow);
 
-			// NC aggressiveness — только если NC поддерживается
-			if (mNcAvailable) {
-				mNcLevelRow = new LinearLayout(this);
-				mNcLevelRow.setOrientation(LinearLayout.HORIZONTAL);
-				mNcLevelRow.setGravity(Gravity.CENTER_VERTICAL);
-				mNcLevelRow.setVisibility(View.GONE);
+			// ── Общий слайдер агрессивности (NC / Custom NC) ────────────────
+			mNcLevelRow = new LinearLayout(this);
+			mNcLevelRow.setOrientation(LinearLayout.HORIZONTAL);
+			mNcLevelRow.setGravity(Gravity.CENTER_VERTICAL);
+			mNcLevelRow.setVisibility(View.GONE);
 
-				mTvNcLevel = smallLabel("NC lv:2");
-				SeekBar sbNcLvl = new SeekBar(this);
-				sbNcLvl.setMax(3);
-				sbNcLvl.setProgress(2);
-				sbNcLvl.setLayoutParams(new LinearLayout.LayoutParams(dp(80), ViewGroup.LayoutParams.WRAP_CONTENT));
-				sbNcLvl.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-					public void onProgressChanged(SeekBar s, int p, boolean u) {
-						mNcLevel = p;
-						if (mTvNcLevel != null) mTvNcLevel.setText("NC lv:" + p);
-						if (mNcEnabled) applyAudioEffects();
-					}
-					public void onStartTrackingTouch(SeekBar s) {}
-					public void onStopTrackingTouch(SeekBar s) {}
-				});
-				mNcLevelRow.addView(mTvNcLevel);
-				mNcLevelRow.addView(sbNcLvl);
-				settingsCol2.addView(mNcLevelRow);
-			}
+			mTvNcLevel = smallLabel("NC agg:2");
+			SeekBar sbNcLvl = new SeekBar(this);
+			sbNcLvl.setMax(3);
+			sbNcLvl.setProgress(2);
+			sbNcLvl.setLayoutParams(new LinearLayout.LayoutParams(dp(80), ViewGroup.LayoutParams.WRAP_CONTENT));
+			sbNcLvl.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+				public void onProgressChanged(SeekBar s, int p, boolean u) {
+					mNcLevel = p;
+					updateNcLevelLabel();
+					if (mNcEnabled) applyAudioEffects();
+					// Custom NC читает mNcLevel напрямую из потока
+				}
+				public void onStartTrackingTouch(SeekBar s) {}
+				public void onStopTrackingTouch(SeekBar s) {}
+			});
+			mNcLevelRow.addView(mTvNcLevel);
+			mNcLevelRow.addView(sbNcLvl);
+			settingsCol2.addView(mNcLevelRow);
 		}
 		// ────────────────────────────────────────────────────────────────────
 
@@ -1514,6 +1537,78 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		} catch (Exception ignored) {}
 	}
 
+	/**
+	 * Обновляет метку слайдера агрессивности в зависимости от того,
+	 * какой NC активен: системный, кастомный или оба.
+	 */
+	private void updateNcLevelLabel() {
+		if (mTvNcLevel == null) return;
+		String mode;
+		if (mNcEnabled && mCustomNcEnabled) mode = "NC+Cust:";
+		else if (mCustomNcEnabled)           mode = "Cust:";
+		else                                 mode = "NC agg:";
+		runOnUiThread(() -> mTvNcLevel.setText(mode + mNcLevel));
+	}
+
+	/**
+	 * Кастомное DSP-шумоподавление: адаптивный шумовой гейт с оценкой
+	 * шумового пола методом скользящего RMS-минимума.
+	 *
+	 * Алгоритм:
+	 *   1. Считаем RMS текущего 20-мс фрейма.
+	 *   2. Обновляем оценку шумового пола (быстро снижаем, медленно растём).
+	 *   3. Вычисляем SNR = frameRms / noiseFloor.
+	 *   4. При SNR < threshold — плавно подавляем сигнал (soft knee gate).
+	 *
+	 * @param buf    PCM-буфер (16-bit signed, interleaved channels)
+	 * @param r      число сэмплов (не байт)
+	 */
+	private void applyCustomNc(short[] buf, int r) {
+		// Параметры по агрессивности 0..3
+		final int agg = mNcLevel; // 0=мягко, 3=агрессивно
+		// Скорость обновления шумового пола (вниз быстрее, вверх медленнее)
+		final float alphaDown = 0.08f + agg * 0.04f;
+		final float alphaUp   = 0.005f + agg * 0.003f;
+		// Порог SNR: при SNR ниже этого — подавляем
+		final float threshold  = 2.0f + agg * 1.0f; // 2..5
+		// Остаточный уровень сигнала в подавляемой зоне (0=тишина, 1=без изменений)
+		final float residual   = 0.07f - agg * 0.015f; // 0.07..0.025
+
+		// Считаем RMS фрейма
+		long sumSqLocal = 0;
+		for (int i = 0; i < r; i++) sumSqLocal += (long) buf[i] * buf[i];
+		float frameRms = (float) Math.sqrt((double) sumSqLocal / r);
+
+		// Обновляем оценку шумового пола
+		if (mNoiseFloorEst < 1f) {
+			mNoiseFloorEst = frameRms; // первая инициализация
+		} else if (frameRms < mNoiseFloorEst) {
+			mNoiseFloorEst = mNoiseFloorEst * (1f - alphaDown) + frameRms * alphaDown;
+		} else {
+			mNoiseFloorEst = mNoiseFloorEst * (1f - alphaUp) + frameRms * alphaUp;
+		}
+		if (mNoiseFloorEst < 1f) mNoiseFloorEst = 1f;
+
+		// SNR и soft-knee gate
+		float snr = frameRms / mNoiseFloorEst;
+		float gain;
+		if (snr >= threshold) {
+			gain = 1f; // речь/музыка — не трогаем
+		} else {
+			// Мягкое подавление: t=0 при snr=0, t=1 при snr=threshold
+			float t = snr / threshold;
+			gain = residual + (1f - residual) * t * t; // квадратичное knee
+		}
+
+		// Применяем gain к буферу
+		if (gain < 1f) {
+			for (int i = 0; i < r; i++) {
+				float s = buf[i] * gain;
+				buf[i] = (short)(s > 32767f ? 32767f : (s < -32768f ? -32768f : s));
+			}
+		}
+	}
+
 	/** Применяет текущие настройки к активной AudioRecord сессии (вызов из UI). */
 	private void applyAudioEffects() {
 		AudioRecord rec = mAudRec;
@@ -1552,6 +1647,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				if (s > 32767f) s = 32767f; else if (s < -32768f) s = -32768f;
 				buf[i] = (short) s; sumSq += (long) buf[i] * buf[i];
 			}
+
+			// ── Custom NC: DSP-шумоподавление по оценке шумового пола ────────
+			if (mCustomNcEnabled) applyCustomNc(buf, r);
+
 			float peakAmp = 0f;
 			for (int i = 0; i < r; i++) { float a = Math.abs(buf[i]) / 32768f; if (a > peakAmp) peakAmp = a; }
 			mVu.setPeak(peakAmp);
