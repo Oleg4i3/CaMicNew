@@ -202,6 +202,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private final java.util.ArrayDeque<short[]> mNcDelayQ = new java.util.ArrayDeque<>();
 	private int mNcDelayedSamples = 0;             // сэмплов в очереди
 	private CheckBox mCbCustomNc;
+	private CheckBox mCbOsc;   // видимость осциллографа
+	private CheckBox mCbSpec;  // видимость спектра
 
 	// ─── Аудио-источники ──────────────────────────────────────────────────────
 	private final List<AudioSrcItem> mSrcList = new ArrayList<>();
@@ -651,7 +653,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		cbRow.addView(mCbEis);
 
 		// Чекбоксы видимости анализаторов
-		CheckBox mCbOsc = new CheckBox(this);
+		mCbOsc = new CheckBox(this);
 		mCbOsc.setText("Oscilloscope");
 		mCbOsc.setTextColor(0xCCCCCCCC);
 		mCbOsc.setTextSize(12);
@@ -661,7 +663,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			if (mEnvelope != null) mEnvelope.setVisibility(checked ? View.GONE : View.VISIBLE);
 		});
 
-		CheckBox mCbSpec = new CheckBox(this);
+		mCbSpec = new CheckBox(this);
 		mCbSpec.setText("Spectrum analyzer");
 		mCbSpec.setTextColor(0xCCCCCCCC);
 		mCbSpec.setTextSize(12);
@@ -1168,7 +1170,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		e.putInt("videoBps", mVideoBps);
 		// ── Pre-buffer ────────────────────────────────────────────────────────
 		e.putBoolean("preBuf", mPreBufferEnabled);
-		e.putInt    ("preBufSecs", mPreBufferSecs);
+		e.putInt    ("preBufSecs", mPreBufSecs);
 		// ── Audio source spinner ──────────────────────────────────────────────
 		if (mSpinner != null) e.putInt("audSrc", mSpinner.getSelectedItemPosition());
 		// ── Visibility toggles ────────────────────────────────────────────────
@@ -1202,7 +1204,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mVideoBps = p.getInt("videoBps", mVideoBps);
 		// ── Pre-buffer ────────────────────────────────────────────────────────
 		mPreBufferEnabled = p.getBoolean("preBuf",     true);
-		mPreBufferSecs    = p.getInt    ("preBufSecs", 1);
+		mPreBufSecs    = p.getInt    ("preBufSecs", 1);
 		// ── Audio source (отложенно — список может ещё не заполниться) ────────
 		int audSrcIdx = p.getInt("audSrc", 0);
 		if (mSpinner != null && audSrcIdx < mSpinner.getCount())
