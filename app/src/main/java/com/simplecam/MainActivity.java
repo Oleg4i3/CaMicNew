@@ -284,6 +284,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mFocusAssistHandler = new Handler(Looper.getMainLooper());
 		setContentView(buildLayout());
 		mCamMgr = (CameraManager) getSystemService(CAMERA_SERVICE);
+		loadPrefs();
 		showAirplaneModeReminder();
 		checkPerms();
 	}
@@ -297,6 +298,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
 	@Override
 	protected void onPause() {
+		savePrefs();
 		super.onPause();
 		if (mRecording) mRecording = false;
 		stopEisOverlay(); // освобождаем ImageReader и PiP поток
@@ -304,6 +306,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	
 	@Override
 	protected void onDestroy() {
+		savePrefs();
 		super.onDestroy();
 		if (mCamHandler != null)
 			mCamHandler.removeCallbacks(mZoomRunnable);
@@ -724,7 +727,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
 		// ── WAV sidecar ──────────────────────────────────────────────────────
 		mCbRecordWav = new CheckBox(this);
-		mCbRecordWav.setText("WAV (несжатый звук в отдельный файл)");
+		mCbRecordWav.setText("WAV sidecar (uncompressed audio)");
 		mCbRecordWav.setTextColor(0xCCCCCCCC);
 		mCbRecordWav.setTextSize(12);
 		mCbRecordWav.setOnCheckedChangeListener((cb, checked) -> {
@@ -1111,6 +1114,104 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	// Напоминание — авиарежим
 	// =========================================================================
 
+	private void showHelp() {
+		new android.app.AlertDialog.Builder(this)
+			.setTitle("\u2139  CaMic — Settings Guide")
+			.setMessage(
+				"GAIN  Vertical slider on the left.\n" +
+				"  0 dB = center. Range \u221220 to +20 dB.\n\n" +
+				"SOFT CLIP  Gentle saturation limiter.\n" +
+				"  Prevents digital clipping on loud transients.\n\n" +
+				"AGC  System automatic gain control.\n\n" +
+				"NC  System hardware noise cancellation.\n\n" +
+				"CUST.NC  Software noise gate with lookahead (30 ms).\n" +
+				"  Thr  — open threshold (× noise floor). Start around 2\u00d7.\n" +
+				"  Hyst — hysteresis in dB. How far below Thr the gate\n" +
+				"         closes. \u22126 dB = gate closes at half amplitude.\n" +
+				"  Rel  — release time. How long the tail fades after gate\n" +
+				"         closes. 600\u2013800 ms suits most strings.\n" +
+				"  Res  — residual level (0 = silence, 100% = no gate).\n" +
+				"         Acts as an expander when > 0.\n\n" +
+				"PRE-BUFFER  Keeps a rolling buffer so recording\n" +
+				"  starts slightly in the past (1\u20135 s).\n\n" +
+				"EIS  Electronic image stabilisation (crop-based).\n" +
+				"  Adds slight crop; A/V sync is compensated automatically.\n\n" +
+				"WAV  Records a separate uncompressed sidecar file\n" +
+				"  (pre-gate, pre-NC — raw capture).\n\n" +
+				"BPS / RES  Video bitrate and resolution.\n" +
+				"  Cannot be changed during recording.")
+			.setPositiveButton("OK", null)
+			.show();
+	}
+
+	private static final String P = "cam_prefs";
+	private void savePrefs() {
+		android.content.SharedPreferences.Editor e =
+			getSharedPreferences(P, 0).edit();
+		// ── Audio FX ─────────────────────────────────────────────────────────
+		if (mCbAgc        != null) e.putBoolean("agc",         mCbAgc.isChecked());
+		if (mCbNc         != null) e.putBoolean("nc",          mCbNc.isChecked());
+		if (mCbCustomNc   != null) e.putBoolean("customNc",    mCbCustomNc.isChecked());
+		if (mCbSoftClip   != null) e.putBoolean("softClip",    mCbSoftClip.isChecked());
+		if (mCbRecordWav  != null) e.putBoolean("recordWav",   mCbRecordWav.isChecked());
+		if (mCbEis        != null) e.putBoolean("eis",         mCbEis.isChecked());
+		// ── Custom NC gate params ─────────────────────────────────────────────
+		e.putFloat("ncThr",     mNcThreshMult);
+		e.putFloat("ncHyst",    mNcHystDb);
+		e.putInt  ("ncRel",     mNcReleaseMs);
+		e.putFloat("ncRes",     mNcResidual);
+		// ── Gain slider ───────────────────────────────────────────────────────
+		if (mSeekGain != null) e.putInt("gain", mSeekGain.getProgress());
+		// ── Video ─────────────────────────────────────────────────────────────
+		e.putInt("videoW",  mVideoW);
+		e.putInt("videoH",  mVideoH);
+		e.putInt("videoBps", mVideoBps);
+		// ── Pre-buffer ────────────────────────────────────────────────────────
+		e.putBoolean("preBuf", mPreBufferEnabled);
+		e.putInt    ("preBufSecs", mPreBufferSecs);
+		// ── Audio source spinner ──────────────────────────────────────────────
+		if (mSpinner != null) e.putInt("audSrc", mSpinner.getSelectedItemPosition());
+		// ── Visibility toggles ────────────────────────────────────────────────
+		if (mCbOsc != null) e.putBoolean("showOsc", mCbOsc.isChecked());
+		if (mCbSpec != null) e.putBoolean("showSpec", mCbSpec.isChecked());
+		e.apply();
+	}
+
+	// loadPrefs вызывается в конце onCreate, ПОСЛЕ создания всех View
+	private void loadPrefs() {
+		android.content.SharedPreferences p =
+			getSharedPreferences(P, 0);
+		if (!p.contains("gain")) return; // первый запуск — не трогаем дефолты
+		// ── Audio FX ─────────────────────────────────────────────────────────
+		if (mCbAgc      != null) mCbAgc.setChecked(p.getBoolean("agc",      false));
+		if (mCbNc       != null) mCbNc.setChecked( p.getBoolean("nc",       false));
+		if (mCbCustomNc != null) mCbCustomNc.setChecked(p.getBoolean("customNc", false));
+		if (mCbSoftClip != null) mCbSoftClip.setChecked(p.getBoolean("softClip", false));
+		if (mCbRecordWav!= null) mCbRecordWav.setChecked(p.getBoolean("recordWav", false));
+		// EIS не восстанавливаем автоматически — требует startEisOverlay()
+		// ── Custom NC ─────────────────────────────────────────────────────────
+		mNcThreshMult = p.getFloat("ncThr",  2.0f);
+		mNcHystDb     = p.getFloat("ncHyst", -6.0f);
+		mNcReleaseMs  = p.getInt  ("ncRel",  600);
+		mNcResidual   = p.getFloat("ncRes",  0.0f);
+		// ── Gain ─────────────────────────────────────────────────────────────
+		if (mSeekGain != null) mSeekGain.setProgress(p.getInt("gain", 400));
+		// ── Video ─────────────────────────────────────────────────────────────
+		mVideoW   = p.getInt("videoW",   1920);
+		mVideoH   = p.getInt("videoH",   1080);
+		mVideoBps = p.getInt("videoBps", mVideoBps);
+		// ── Pre-buffer ────────────────────────────────────────────────────────
+		mPreBufferEnabled = p.getBoolean("preBuf",     true);
+		mPreBufferSecs    = p.getInt    ("preBufSecs", 1);
+		// ── Audio source (отложенно — список может ещё не заполниться) ────────
+		int audSrcIdx = p.getInt("audSrc", 0);
+		if (mSpinner != null && audSrcIdx < mSpinner.getCount())
+			mSpinner.setSelection(audSrcIdx);
+		// ── Visibility ────────────────────────────────────────────────────────
+		if (mCbOsc  != null) mCbOsc.setChecked(p.getBoolean("showOsc",  true));
+		if (mCbSpec != null) mCbSpec.setChecked(p.getBoolean("showSpec", true));
+	}
+
 	private void showAirplaneModeReminder() {
 		new android.app.AlertDialog.Builder(this)
 			.setTitle("\u2708  Airplane Mode recommended")
@@ -1121,6 +1222,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				"and Wi-Fi interruptions during recording.\n\n" +
 				"(Screen will stay on while the app is open.)")
 			.setPositiveButton("Got it", null)
+			.setNegativeButton("\u2753 Help", (d, w) -> showHelp())
 			.setNeutralButton("Open Settings", (d, w) -> {
 				try {
 					startActivity(new android.content.Intent(
