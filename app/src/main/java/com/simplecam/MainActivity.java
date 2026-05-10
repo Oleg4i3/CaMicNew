@@ -187,6 +187,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private float mNcFloorEst = 0f;   // оценка шумового пола
 	private float mNcGateGain = 1f;   // текущий gain гейта
 	private boolean mNcGateOpen = true;
+	private float   mNcAttackPhase = 0f; // 0..1, прогресс сигмоидной атаки
 	// ── Открытые параметры гейта (регулируются слайдерами) ───────────────────
 	/** Множитель порога открытия: openThresh = floor × mNcThreshMult */
 	private volatile float mNcThreshMult = 2.0f;  // 1.0 .. 10
@@ -237,6 +238,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private volatile int mVidWriteMode = 0;
 	private volatile int mAudWriteMode = 0;
 	private volatile long mMuxBasePts  = 0L;
+	/** Единая временная база записи (мкс, System.nanoTime/1000 в момент REC). */
+	private volatile long mRecStartUs   = 0L;
 	private volatile MediaFormat mVidOutFmt = null;
 	private volatile MediaFormat mAudOutFmt = null;
 	private volatile boolean mVidLoopRunning = false;
@@ -829,7 +832,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			mCbCustomNc.setChecked(false);
 			mCbCustomNc.setOnCheckedChangeListener((cb, on) -> {
 				mCustomNcEnabled = on;
-				if (on) { mNcRmsEst=0f; mNcFloorEst=0f; mNcGateGain=1f; mNcGateOpen=true; mNcDelayQ.clear(); mNcDelayedSamples=0; }
+				if (on) { mNcRmsEst=0f; mNcFloorEst=0f; mNcGateGain=1f; mNcGateOpen=true; mNcAttackPhase=0f; mNcDelayQ.clear(); mNcDelayedSamples=0; }
 				if (mNcLevelRow != null)
 					mNcLevelRow.setVisibility((on || mNcEnabled) ? View.VISIBLE : View.GONE);
 				updateNcLevelLabel();
@@ -1664,9 +1667,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		// Гистерезис в дБ: closeThresh = openThresh × 10^(dB/20)
 		final float hystLinear = (float) Math.pow(10.0, mNcHystDb / 20.0); // <1
 		final float closeMult = openMult * hystLinear;
-		// Атака хардкодом: tau=0.5ms → ~99% за 2.3ms (психоакустически гладко)
-		// per-sample коэффициент: 1 - exp(-1/(SR*0.0005))
-		final float ATK_PER_SAMPLE = 1f - (float) Math.exp(-1.0 / (AUDIO_SR * 0.0005));
+		// Атака: сигмоида smoothstep 3t²-2t³ за ATK_SAMPLES сэмплов.
+		// Нулевая производная на обоих концах → нет излома → нет щелчка.
+		// Длина ~4ms при 48 кГц; lookahead 30ms покрывает с запасом.
+		final int   ATK_SAMPLES = (int)(AUDIO_SR * 0.004f); // 4 мс
+		final float ATK_STEP    = 1f / ATK_SAMPLES;
 		// Release: per-sample коэффициент (аналогично атаке)
 		// tau = releaseMs/1000 с, dt = 1/AUDIO_SR с → alpha = exp(-dt/tau)
 		final float REL_PER_SAMPLE = (float) Math.exp(-1000.0 / ((double) AUDIO_SR * mNcReleaseMs));
@@ -1695,9 +1700,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		float closeThresh = mNcFloorEst * closeMult;
 
 		if (!mNcGateOpen && mNcRmsEst >= openThresh) {
-			mNcGateOpen = true;                 // открываем (быстрая атака)
+			mNcGateOpen = true;
+			mNcAttackPhase = 0f; // запускаем сигмоиду с нуля
 		} else if (mNcGateOpen && mNcRmsEst < closeThresh) {
-			mNcGateOpen = false;                // начинаем рилив
+			mNcGateOpen = false;
 		}
 
 		// ── Применяем gain к буферу с плавной атакой/риливом ─────────────────────
@@ -1721,10 +1727,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		int outLen = Math.min(r, outBuf.length);
 		for (int i = 0; i < outLen; i++) {
 			if (mNcGateOpen) {
-				// Атака: экспоненциальное приближение к 1 (tau=0.5ms)
-				// dB/время линейно → психоакустически равномерный нарастание громкости
-				mNcGateGain += (1f - mNcGateGain) * ATK_PER_SAMPLE;
-				if (mNcGateGain > 1f) mNcGateGain = 1f;
+				// Атака: smoothstep(t) = 3t²-2t³  (сигмоида Ken Perlin)
+				// Производная = 0 при t=0 и t=1 → абсолютно гладкий старт и конец
+				if (mNcAttackPhase < 1f) {
+					mNcAttackPhase = Math.min(1f, mNcAttackPhase + ATK_STEP);
+					float t = mNcAttackPhase;
+					mNcGateGain = residual + (1f - residual) * t * t * (3f - 2f * t);
+				} else {
+					mNcGateGain = 1f;
+				}
 			} else {
 				// Рилив: экспоненциальное затухание к residual (per-sample, tau=releaseMs)
 				mNcGateGain = residual + (mNcGateGain - residual) * REL_PER_SAMPLE;
@@ -1751,8 +1762,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		final int chunkSamples = AUDIO_SR * ch / 50; // 20 мс
 		short[] buf = new short[chunkSamples];
 		// Абсолютный старт в мкс — тот же CLOCK_MONOTONIC, что у видео-сенсора
-		final long startUs = System.nanoTime() / 1000L;
+		// startUs синхронизируется с mRecStartUs при первом write (см. ниже)
+		long startUs = System.nanoTime() / 1000L;
 		long totalFrames = 0L;
+		boolean startUsSynced = false;
 
 		rec.startRecording();
 		while (mAudRunning) {
@@ -1796,6 +1809,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			MediaCodec enc = mAudEnc;
 			if (enc == null) continue;
 			// PTS: абсолютный System.nanoTime (мкс) — тот же домен, что у видео
+			// Синхронизируем временну́ю базу аудио с видео при первом write
+			if (!startUsSynced && mRecStartUs != 0L && mAudWriteMode != 0) {
+				// Пересчитываем startUs так, чтобы PTS текущего фрейма
+				// совпал с видео-базой. totalFrames уже накоплены — компенсируем.
+				startUs = mRecStartUs - totalFrames * 1_000_000L / AUDIO_SR;
+				startUsSynced = true;
+			}
 			long pts = startUs + totalFrames * 1_000_000L / AUDIO_SR
 					- (mCustomNcEnabled ? (long) NC_LOOKAHEAD_MS * 1000L : 0L);
 			totalFrames += r / ch;
@@ -1896,7 +1916,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				return;
 			}
 
-			// ── Вычисляем mMuxBasePts по первому I-frame в видео-кольце ───────
+			// ── Единая база времени — фиксируем ДО старта потоков ──────────────
+			// mRecStartUs — общий нулевой момент для аудио и видео.
+			// При пре-буфере: берём PTS первого I-frame в кольце (он на этом же clock).
+			// Без пре-буфера: System.nanoTime()/1000 прямо сейчас.
+			// В обоих случаях mMuxBasePts = mRecStartUs, и аудио использует его же.
 			long basePts;
 			synchronized(mVidRingLock) {
 				if (mPreBufferEnabled) {
@@ -1904,13 +1928,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					for (EncodedFrame f : mVidRing) {
 						if (f.isKey()) { basePts = f.pts; break; }
 					}
-					if (basePts == Long.MAX_VALUE) basePts = 0;
+					if (basePts == Long.MAX_VALUE) basePts = System.nanoTime() / 1000L;
 				} else {
-					// Без пре-буфера: берём PTS следующего I-frame (придёт через ≤1 с)
-					// Пока ждём его — просто ставим текущее время
 					basePts = System.nanoTime() / 1000L;
 				}
 			}
+			mRecStartUs = basePts;
 			mMuxBasePts = basePts;
 
 			// ── Создаём MediaStore-запись ──────────────────────────────────────
