@@ -204,6 +204,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private CheckBox mCbCustomNc;
 	private CheckBox mCbOsc;   // видимость осциллографа
 	private CheckBox mCbSpec;  // видимость спектра
+	// NC slider references (нужны для loadPrefs)
+	private SeekBar  mSbNcThr, mSbNcHyst, mSbNcRel, mSbNcRes;
+	private TextView mTvNcThr, mTvNcHyst, mTvNcRel, mTvNcRes;
 
 	// ─── EQ ───────────────────────────────────────────────────────────────────
 	private volatile boolean mEqEnabled = false;
@@ -214,6 +217,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private final Object mEqLock = new Object();
 	private LinearLayout mEqListView;
 	private CheckBox mCbEqEnable;
+	private EqOverlayView mEqOverlay;
 
 	// ─── Аудио-источники ──────────────────────────────────────────────────────
 	private final List<AudioSrcItem> mSrcList = new ArrayList<>();
@@ -247,16 +251,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	// HPF/LPF — 2nd order Butterworth (Q=1/√2); Peak — standard RBJ peak EQ biquad.
 	// All implemented as Direct Form II Transposed for numerical stability.
 	private static class EqBand {
-		static final int HPF = 0, LPF = 1, PEAK = 2;
+		static final int HPF = 0, LPF = 1, PEAK = 2, LSHELF = 3, HSHELF = 4;
 		int     type    = HPF;
 		boolean enabled = true;
 		float   freq    = 1000f;
-		float   q       = 1.0f;
-		float   gainDb  = 0f;
+		float   q       = 1.0f;   // не используется для HPF/LPF/Shelf
+		float   gainDb  = 0f;     // для PEAK, LSHELF, HSHELF
+		float   slopeDb = 6f;     // для LSHELF/HSHELF: крутизна переходной зоны (дБ/октаву), 6..24
 		// Biquad coefficients (normalized, a0=1):
-		//   y[n] = b0*x[n] + b1*x[n-1] + b2*x[n-2] - a1*y[n-1] - a2*y[n-2]
 		double b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
-		// Per-channel state: index 0=L (or mono), 1=R
+		// Per-channel state
 		final double[] x1 = new double[2], x2 = new double[2];
 		final double[] y1 = new double[2], y2 = new double[2];
 
@@ -266,8 +270,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			double cw  = Math.cos(w0), sw = Math.sin(w0);
 			double rb0, rb1, rb2, ra0, ra1, ra2;
 			if (type == HPF) {
-				// 2nd-order Butterworth HPF: Q = 1/√2
-				double alpha = sw / Math.sqrt(2.0); // sw / (2*Q) with Q=1/√2
+				double alpha = sw / Math.sqrt(2.0);
 				rb0 =  (1.0 + cw) / 2.0;
 				rb1 = -(1.0 + cw);
 				rb2 =  (1.0 + cw) / 2.0;
@@ -275,7 +278,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				ra1 =  -2.0 * cw;
 				ra2 =   1.0 - alpha;
 			} else if (type == LPF) {
-				// 2nd-order Butterworth LPF: Q = 1/√2
 				double alpha = sw / Math.sqrt(2.0);
 				rb0 =  (1.0 - cw) / 2.0;
 				rb1 =   1.0 - cw;
@@ -283,8 +285,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				ra0 =   1.0 + alpha;
 				ra1 =  -2.0 * cw;
 				ra2 =   1.0 - alpha;
-			} else {
-				// Peak EQ biquad (RBJ cookbook)
+			} else if (type == PEAK) {
 				double Q = Math.max(0.1, q);
 				double A = Math.pow(10.0, gainDb / 40.0);
 				double alpha = sw / (2.0 * Q);
@@ -294,6 +295,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				ra0 =  1.0 + alpha / A;
 				ra1 = -2.0 * cw;
 				ra2 =  1.0 - alpha / A;
+			} else {
+				// LSHELF / HSHELF — RBJ cookbook shelving EQ
+				// S = slope параметр: S=1 → максимально крутой Butterworth shelf
+				// Отображаем slopeDb (6..24 дБ/окт) → S (0.25..1)
+				double A = Math.pow(10.0, gainDb / 40.0);
+				double S = Math.max(0.25, Math.min(1.0, slopeDb / 24.0));
+				double alpha = sw / 2.0 * Math.sqrt((A + 1.0 / A) * (1.0 / S - 1.0) + 2.0);
+				double sqA2  = 2.0 * Math.sqrt(A) * alpha;
+				if (type == LSHELF) {
+					rb0 =       A * ((A + 1) - (A - 1) * cw + sqA2);
+					rb1 =  2.0 * A * ((A - 1) - (A + 1) * cw);
+					rb2 =       A * ((A + 1) - (A - 1) * cw - sqA2);
+					ra0 =            (A + 1) + (A - 1) * cw + sqA2;
+					ra1 = -2.0 *    ((A - 1) + (A + 1) * cw);
+					ra2 =            (A + 1) + (A - 1) * cw - sqA2;
+				} else { // HSHELF
+					rb0 =       A * ((A + 1) + (A - 1) * cw + sqA2);
+					rb1 = -2.0 * A * ((A - 1) + (A + 1) * cw);
+					rb2 =       A * ((A + 1) + (A - 1) * cw - sqA2);
+					ra0 =            (A + 1) - (A - 1) * cw + sqA2;
+					ra1 =  2.0 *    ((A - 1) - (A + 1) * cw);
+					ra2 =            (A + 1) - (A - 1) * cw - sqA2;
+				}
 			}
 			b0 = rb0 / ra0; b1 = rb1 / ra0; b2 = rb2 / ra0;
 			a1 = ra1 / ra0; a2 = ra2 / ra0;
@@ -941,63 +965,63 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				LinearLayout row = new LinearLayout(this);
 				row.setOrientation(LinearLayout.HORIZONTAL);
 				row.setGravity(Gravity.CENTER_VERTICAL);
-				final TextView tvLbl = smallLabel("Thr:2.0x");
-				tvLbl.setMinWidth(dp(52));
-				SeekBar sb = new SeekBar(this);
-				sb.setMax(100);
-				sb.setProgress(11);
-				sb.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-				sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+				mTvNcThr = smallLabel("Thr:2.0x");
+				mTvNcThr.setMinWidth(dp(52));
+				mSbNcThr = new SeekBar(this);
+				mSbNcThr.setMax(100);
+				mSbNcThr.setProgress(11);
+				mSbNcThr.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+				mSbNcThr.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
 					public void onProgressChanged(SeekBar s, int p, boolean u) {
 						mNcThreshMult = 1.0f + p * 0.09f;
-						tvLbl.setText(String.format("Thr:%.1fx", mNcThreshMult));
+						mTvNcThr.setText(String.format("Thr:%.1fx", mNcThreshMult));
 					}
 					public void onStartTrackingTouch(SeekBar s) {}
 					public void onStopTrackingTouch(SeekBar s) {}
 				});
-				row.addView(tvLbl); row.addView(sb);
+				row.addView(mTvNcThr); row.addView(mSbNcThr);
 				mNcLevelRow.addView(row);
 			}
 			{
 				LinearLayout row = new LinearLayout(this);
 				row.setOrientation(LinearLayout.HORIZONTAL);
 				row.setGravity(Gravity.CENTER_VERTICAL);
-				final TextView tvLbl = smallLabel("Hyst:-6dB");
-				tvLbl.setMinWidth(dp(52));
-				SeekBar sb = new SeekBar(this);
-				sb.setMax(120);
-				sb.setProgress(60);
-				sb.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-				sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+				mTvNcHyst = smallLabel("Hyst:-6dB");
+				mTvNcHyst.setMinWidth(dp(52));
+				mSbNcHyst = new SeekBar(this);
+				mSbNcHyst.setMax(120);
+				mSbNcHyst.setProgress(60);
+				mSbNcHyst.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+				mSbNcHyst.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
 					public void onProgressChanged(SeekBar s, int p, boolean u) {
 						mNcHystDb = -12f + p * 0.1f;
-						tvLbl.setText(String.format("Hyst:%.0fdB", mNcHystDb));
+						mTvNcHyst.setText(String.format("Hyst:%.0fdB", mNcHystDb));
 					}
 					public void onStartTrackingTouch(SeekBar s) {}
 					public void onStopTrackingTouch(SeekBar s) {}
 				});
-				row.addView(tvLbl); row.addView(sb);
+				row.addView(mTvNcHyst); row.addView(mSbNcHyst);
 				mNcLevelRow.addView(row);
 			}
 			{
 				LinearLayout row = new LinearLayout(this);
 				row.setOrientation(LinearLayout.HORIZONTAL);
 				row.setGravity(Gravity.CENTER_VERTICAL);
-				final TextView tvLbl = smallLabel("Rel:600ms");
-				tvLbl.setMinWidth(dp(52));
-				SeekBar sb = new SeekBar(this);
-				sb.setMax(100);
-				sb.setProgress(19);
-				sb.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-				sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+				mTvNcRel = smallLabel("Rel:600ms");
+				mTvNcRel.setMinWidth(dp(52));
+				mSbNcRel = new SeekBar(this);
+				mSbNcRel.setMax(100);
+				mSbNcRel.setProgress(19);
+				mSbNcRel.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+				mSbNcRel.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
 					public void onProgressChanged(SeekBar s, int p, boolean u) {
 						mNcReleaseMs = 50 + Math.round(p * 29.5f);
-						tvLbl.setText("Rel:" + mNcReleaseMs + "ms");
+						mTvNcRel.setText("Rel:" + mNcReleaseMs + "ms");
 					}
 					public void onStartTrackingTouch(SeekBar s) {}
 					public void onStopTrackingTouch(SeekBar s) {}
 				});
-				row.addView(tvLbl); row.addView(sb);
+				row.addView(mTvNcRel); row.addView(mSbNcRel);
 				mNcLevelRow.addView(row);
 			}
 			// ── Residual (экспандер) ─────────────────────────────────────────
@@ -1005,21 +1029,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				LinearLayout row = new LinearLayout(this);
 				row.setOrientation(LinearLayout.HORIZONTAL);
 				row.setGravity(Gravity.CENTER_VERTICAL);
-				final TextView tvLbl = smallLabel("Res:0%");
-				tvLbl.setMinWidth(dp(52));
-				SeekBar sb = new SeekBar(this);
-				sb.setMax(100);
-				sb.setProgress(0);
-				sb.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-				sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+				mTvNcRes = smallLabel("Res:0%");
+				mTvNcRes.setMinWidth(dp(52));
+				mSbNcRes = new SeekBar(this);
+				mSbNcRes.setMax(100);
+				mSbNcRes.setProgress(0);
+				mSbNcRes.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+				mSbNcRes.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
 					public void onProgressChanged(SeekBar s, int p, boolean u) {
 						mNcResidual = p / 100f;
-						tvLbl.setText("Res:" + p + "%");
+						mTvNcRes.setText("Res:" + p + "%");
 					}
 					public void onStartTrackingTouch(SeekBar s) {}
 					public void onStopTrackingTouch(SeekBar s) {}
 				});
-				row.addView(tvLbl); row.addView(sb);
+				row.addView(mTvNcRes); row.addView(mSbNcRes);
 				mNcLevelRow.addView(row);
 			}
 			settingsCol2.addView(mNcLevelRow);
@@ -1038,6 +1062,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				ViewGroup.LayoutParams.MATCH_PARENT, dp(72), Gravity.BOTTOM);
 		specFLP.rightMargin = dp(120);
 		specFrame.addView(mSpectrum, specFLP);
+		// EQ Bode overlay — поверх спектра, тот же размер и margin
+		mEqOverlay = new EqOverlayView(this);
+		android.widget.FrameLayout.LayoutParams eqOvLP =
+			new android.widget.FrameLayout.LayoutParams(
+				ViewGroup.LayoutParams.MATCH_PARENT, dp(72), Gravity.BOTTOM);
+		eqOvLP.rightMargin = dp(120);
+		specFrame.addView(mEqOverlay, eqOvLP);
 		// Настройки — поверх (сверху), поэтому addView после спектра
 		specFrame.addView(mAudioSrcPanel, new android.widget.FrameLayout.LayoutParams(
 			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -1130,18 +1161,30 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		btnAdd.setOnClickListener(v -> {
 			new android.app.AlertDialog.Builder(this)
 				.setTitle("Add filter")
-				.setItems(new String[]{"HPF  (High Pass, −12 dB/oct)", "LPF  (Low Pass, −12 dB/oct)", "Peak (Bell ±12 dB)"}, (d, which) -> {
+				.setItems(new String[]{
+					"HPF  (High Pass, −12 dB/oct)",
+					"LPF  (Low Pass, −12 dB/oct)",
+					"Peak (Bell ±12 dB)",
+					"Low Shelf  (shelf on lows)",
+					"High Shelf (shelf on highs)"
+				}, (d, which) -> {
 					EqBand band = new EqBand();
-					band.type    = which;
-					band.freq    = (which == EqBand.HPF) ? 80f : (which == EqBand.LPF) ? 8000f : 1000f;
+					band.type    = which; // HPF=0,LPF=1,PEAK=2,LSHELF=3,HSHELF=4
+					band.freq    = (which == EqBand.HPF)    ? 80f
+					             : (which == EqBand.LPF)    ? 8000f
+					             : (which == EqBand.LSHELF) ? 120f
+					             : (which == EqBand.HSHELF) ? 8000f
+					             : 1000f;
 					band.q       = 1.0f;
 					band.gainDb  = 0f;
+					band.slopeDb = 6f;
 					band.enabled = true;
 					synchronized (mEqLock) {
 						band.computeCoeffs(AUDIO_SR);
 						mEqBands.add(band);
 					}
 					addEqBandRow(band);
+					if (mEqOverlay != null) mEqOverlay.refresh();
 				})
 				.show();
 		});
@@ -1186,9 +1229,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		return panel;
 	}
 
-	/** Добавляет строку фильтра в mEqListView. Вызывается из UI-треда. */
 	private void addEqBandRow(EqBand band) {
-		final String[] typeNames = {"HPF", "LPF", "PEAK"};
+		final String[] typeNames = {"HPF", "LPF", "PEAK", "L.SHELF", "H.SHELF"};
 
 		LinearLayout row = new LinearLayout(this);
 		row.setOrientation(LinearLayout.VERTICAL);
@@ -1199,7 +1241,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		rowLP.topMargin = dp(4);
 		row.setLayoutParams(rowLP);
 
-		// ── Строка 1: [HPF] [✓ ON] [F: -------- 1000 Hz] [✕] ──────────────
+		// ── Строка 1: [TYPE] [✓ ON] [F: -------- Hz] [✕] ──────────────────
 		LinearLayout top = new LinearLayout(this);
 		top.setOrientation(LinearLayout.HORIZONTAL);
 		top.setGravity(Gravity.CENTER_VERTICAL);
@@ -1209,7 +1251,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		tvType.setTextColor(0xFF88DDFF);
 		tvType.setTextSize(11);
 		tvType.setTypeface(null, android.graphics.Typeface.BOLD);
-		tvType.setMinWidth(dp(34));
+		tvType.setMinWidth(dp(44));
 		top.addView(tvType);
 
 		CheckBox cbEn = new CheckBox(this);
@@ -1217,7 +1259,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		cbEn.setTextColor(0xCCCCCCCC);
 		cbEn.setTextSize(11);
 		cbEn.setChecked(band.enabled);
-		cbEn.setOnCheckedChangeListener((v, on) -> { synchronized (mEqLock) { band.enabled = on; } });
+		cbEn.setOnCheckedChangeListener((v, on) -> {
+			synchronized (mEqLock) { band.enabled = on; }
+			if (mEqOverlay != null) mEqOverlay.refresh();
+		});
 		top.addView(cbEn);
 
 		TextView tvFL = new TextView(this);
@@ -1248,6 +1293,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		btnDel.setOnClickListener(v -> {
 			synchronized (mEqLock) { mEqBands.remove(band); }
 			mEqListView.removeView(row);
+			if (mEqOverlay != null) mEqOverlay.refresh();
 		});
 		top.addView(btnDel);
 		row.addView(top, new LinearLayout.LayoutParams(
@@ -1258,6 +1304,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				float f = eqProgressToFreq(p);
 				tvFreq.setText(eqFormatFreq(f));
 				synchronized (mEqLock) { band.freq = f; band.computeCoeffs(AUDIO_SR); band.resetState(); }
+				if (mEqOverlay != null) mEqOverlay.refresh();
 			}
 			public void onStartTrackingTouch(SeekBar s) {}
 			public void onStopTrackingTouch(SeekBar s) {}
@@ -1269,36 +1316,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			LinearLayout qRow = new LinearLayout(this);
 			qRow.setOrientation(LinearLayout.HORIZONTAL);
 			qRow.setGravity(Gravity.CENTER_VERTICAL);
-
 			TextView tvQL = new TextView(this);
-			tvQL.setText("Q:");
-			tvQL.setTextColor(0xCCCCCCCC);
-			tvQL.setTextSize(11);
-			tvQL.setMinWidth(dp(34));
+			tvQL.setText("Q:"); tvQL.setTextColor(0xCCCCCCCC); tvQL.setTextSize(11); tvQL.setMinWidth(dp(44));
 			qRow.addView(tvQL);
-
 			SeekBar sbQ = new SeekBar(this);
 			sbQ.setMax(100);
 			sbQ.setProgress(Math.round((band.q - 0.1f) / 3.9f * 100f));
 			sbQ.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 			qRow.addView(sbQ);
-
 			final TextView tvQ = new TextView(this);
 			tvQ.setText(String.format("%.2f", band.q));
-			tvQ.setTextColor(0xFFDDDDDD);
-			tvQ.setTextSize(11);
-			tvQ.setMinWidth(dp(54));
+			tvQ.setTextColor(0xFFDDDDDD); tvQ.setTextSize(11); tvQ.setMinWidth(dp(54));
 			qRow.addView(tvQ);
-			// spacer to align with btnDel column
-			TextView tvQSp = new TextView(this); tvQSp.setText("  "); qRow.addView(tvQSp);
-			row.addView(qRow, new LinearLayout.LayoutParams(
-				ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
+			TextView sp1 = new TextView(this); sp1.setText("  "); qRow.addView(sp1);
+			row.addView(qRow, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 			sbQ.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
 				public void onProgressChanged(SeekBar s, int p, boolean u) {
 					float qv = 0.1f + p * 3.9f / 100f;
 					tvQ.setText(String.format("%.2f", qv));
 					synchronized (mEqLock) { band.q = qv; band.computeCoeffs(AUDIO_SR); band.resetState(); }
+					if (mEqOverlay != null) mEqOverlay.refresh();
 				}
 				public void onStartTrackingTouch(SeekBar s) {}
 				public void onStopTrackingTouch(SeekBar s) {}
@@ -1308,35 +1345,87 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			LinearLayout gRow = new LinearLayout(this);
 			gRow.setOrientation(LinearLayout.HORIZONTAL);
 			gRow.setGravity(Gravity.CENTER_VERTICAL);
-
 			TextView tvGL = new TextView(this);
-			tvGL.setText("dB:");
-			tvGL.setTextColor(0xCCCCCCCC);
-			tvGL.setTextSize(11);
-			tvGL.setMinWidth(dp(34));
+			tvGL.setText("dB:"); tvGL.setTextColor(0xCCCCCCCC); tvGL.setTextSize(11); tvGL.setMinWidth(dp(44));
 			gRow.addView(tvGL);
-
 			SeekBar sbGain = new SeekBar(this);
-			sbGain.setMax(48); // −12..+12 dB, шаг 0.5 dB
+			sbGain.setMax(48);
 			sbGain.setProgress(Math.round((band.gainDb + 12f) * 2f));
 			sbGain.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 			gRow.addView(sbGain);
-
 			final TextView tvGain = new TextView(this);
 			tvGain.setText(String.format("%+.1f dB", band.gainDb));
-			tvGain.setTextColor(0xFFDDDDDD);
-			tvGain.setTextSize(11);
-			tvGain.setMinWidth(dp(54));
+			tvGain.setTextColor(0xFFDDDDDD); tvGain.setTextSize(11); tvGain.setMinWidth(dp(54));
 			gRow.addView(tvGain);
-			TextView tvGSp = new TextView(this); tvGSp.setText("  "); gRow.addView(tvGSp);
-			row.addView(gRow, new LinearLayout.LayoutParams(
-				ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
+			TextView sp2 = new TextView(this); sp2.setText("  "); gRow.addView(sp2);
+			row.addView(gRow, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 			sbGain.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
 				public void onProgressChanged(SeekBar s, int p, boolean u) {
 					float gdb = -12f + p * 0.5f;
 					tvGain.setText(String.format("%+.1f dB", gdb));
 					synchronized (mEqLock) { band.gainDb = gdb; band.computeCoeffs(AUDIO_SR); band.resetState(); }
+					if (mEqOverlay != null) mEqOverlay.refresh();
+				}
+				public void onStartTrackingTouch(SeekBar s) {}
+				public void onStopTrackingTouch(SeekBar s) {}
+			});
+		}
+
+		// ── Shelf: Gain и Slope ────────────────────────────────────────────────
+		if (band.type == EqBand.LSHELF || band.type == EqBand.HSHELF) {
+			// Gain row ±12 dB
+			LinearLayout gRow = new LinearLayout(this);
+			gRow.setOrientation(LinearLayout.HORIZONTAL);
+			gRow.setGravity(Gravity.CENTER_VERTICAL);
+			TextView tvGL = new TextView(this);
+			tvGL.setText("dB:"); tvGL.setTextColor(0xCCCCCCCC); tvGL.setTextSize(11); tvGL.setMinWidth(dp(44));
+			gRow.addView(tvGL);
+			SeekBar sbGain = new SeekBar(this);
+			sbGain.setMax(48);
+			sbGain.setProgress(Math.round((band.gainDb + 12f) * 2f));
+			sbGain.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+			gRow.addView(sbGain);
+			final TextView tvGain = new TextView(this);
+			tvGain.setText(String.format("%+.1f dB", band.gainDb));
+			tvGain.setTextColor(0xFFDDDDDD); tvGain.setTextSize(11); tvGain.setMinWidth(dp(54));
+			gRow.addView(tvGain);
+			TextView spG = new TextView(this); spG.setText("  "); gRow.addView(spG);
+			row.addView(gRow, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+			sbGain.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+				public void onProgressChanged(SeekBar s, int p, boolean u) {
+					float gdb = -12f + p * 0.5f;
+					tvGain.setText(String.format("%+.1f dB", gdb));
+					synchronized (mEqLock) { band.gainDb = gdb; band.computeCoeffs(AUDIO_SR); band.resetState(); }
+					if (mEqOverlay != null) mEqOverlay.refresh();
+				}
+				public void onStartTrackingTouch(SeekBar s) {}
+				public void onStopTrackingTouch(SeekBar s) {}
+			});
+
+			// Slope row: 6..24 дБ/окт
+			LinearLayout sRow = new LinearLayout(this);
+			sRow.setOrientation(LinearLayout.HORIZONTAL);
+			sRow.setGravity(Gravity.CENTER_VERTICAL);
+			TextView tvSL = new TextView(this);
+			tvSL.setText("Slp:"); tvSL.setTextColor(0xCCCCCCCC); tvSL.setTextSize(11); tvSL.setMinWidth(dp(44));
+			sRow.addView(tvSL);
+			SeekBar sbSlope = new SeekBar(this);
+			sbSlope.setMax(18); // 6..24 шаг 1 → 18 позиций
+			sbSlope.setProgress(Math.round(band.slopeDb - 6f));
+			sbSlope.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+			sRow.addView(sbSlope);
+			final TextView tvSlope = new TextView(this);
+			tvSlope.setText(String.format("%.0f dB/oct", band.slopeDb));
+			tvSlope.setTextColor(0xFFDDDDDD); tvSlope.setTextSize(11); tvSlope.setMinWidth(dp(54));
+			sRow.addView(tvSlope);
+			TextView spS = new TextView(this); spS.setText("  "); sRow.addView(spS);
+			row.addView(sRow, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+			sbSlope.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+				public void onProgressChanged(SeekBar s, int p, boolean u) {
+					float sl = 6f + p;
+					tvSlope.setText(String.format("%.0f dB/oct", sl));
+					synchronized (mEqLock) { band.slopeDb = sl; band.computeCoeffs(AUDIO_SR); band.resetState(); }
+					if (mEqOverlay != null) mEqOverlay.refresh();
 				}
 				public void onStartTrackingTouch(SeekBar s) {}
 				public void onStopTrackingTouch(SeekBar s) {}
@@ -1344,6 +1433,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		}
 
 		mEqListView.addView(row);
+		if (mEqOverlay != null) mEqOverlay.refresh();
 	}
 
 	// Логарифмическая шкала частот: 20 Гц .. 18 кГц (progress 0..100)
@@ -1373,6 +1463,98 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					buf[i] = (short)(s > 32767f ? 32767 : (s < -32768f ? -32768 : (int) s));
 				}
 			}
+		}
+	}
+
+	// =========================================================================
+	// EqOverlayView — Bode plot поверх спектр-анализатора
+	// =========================================================================
+	private class EqOverlayView extends View {
+		private final android.graphics.Paint mCurvePaint = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+		private final android.graphics.Paint mGridPaint  = new android.graphics.Paint();
+		private final android.graphics.Paint mLblPaint   = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+		private static final int PLOT_POINTS = 256;
+		// Масштаб должен совпадать со SpectrumView:
+		// X: log10(f) от log10(20) до log10(sr/2), Y: 0..h → −90..0 dB (norm 0..1)
+		// Мы отображаем EQ response в диапазоне ±20 dB вокруг 0 dB:
+		// центр (0 дБ) → середина высоты; −20 дБ → низ; +20 дБ → верх
+		private static final float DB_RANGE = 20f; // ±20 dB
+
+		EqOverlayView(android.content.Context ctx) {
+			super(ctx);
+			mCurvePaint.setColor(0xFFFFD700);
+			mCurvePaint.setStrokeWidth(2.5f);
+			mCurvePaint.setStyle(android.graphics.Paint.Style.STROKE);
+			mCurvePaint.setStrokeJoin(android.graphics.Paint.Join.ROUND);
+			mGridPaint.setColor(0x44FFD700);
+			mGridPaint.setStrokeWidth(0.8f);
+			mLblPaint.setColor(0xAAFFD700);
+			mLblPaint.setTextSize(dp(8));
+			mLblPaint.setTextAlign(android.graphics.Paint.Align.RIGHT);
+		}
+
+		void refresh() { postInvalidate(); }
+
+		@Override
+		protected void onDraw(Canvas canvas) {
+			final float w = getWidth(), h = getHeight();
+			if (w == 0 || h == 0) return;
+			if (!mEqEnabled) return;
+
+			// Метки частот в SpectrumView занимают верхнюю полосу высотой lblH
+			// воспроизводим то же смещение
+			float lblH = mLblPaint.getTextSize() + 4f;
+			float plotTop = lblH;
+			float plotH   = h - plotTop;
+			float midY    = plotTop + plotH / 2f; // 0 дБ
+
+			// Горизонтальная линия 0 дБ
+			canvas.drawLine(0, midY, w, midY, mGridPaint);
+			// +10 / -10 дБ штрихи
+			float y10 = midY - plotH / 2f * (10f / DB_RANGE);
+			float ym10 = midY + plotH / 2f * (10f / DB_RANGE);
+			canvas.drawLine(0, y10,  w, y10,  mGridPaint);
+			canvas.drawLine(0, ym10, w, ym10, mGridPaint);
+			canvas.drawText("+10", w - 2, y10  + mLblPaint.getTextSize() * 0.4f, mLblPaint);
+			canvas.drawText("-10", w - 2, ym10 + mLblPaint.getTextSize() * 0.4f, mLblPaint);
+			canvas.drawText("  0", w - 2, midY + mLblPaint.getTextSize() * 0.4f, mLblPaint);
+
+			double logFMin = Math.log10(20.0);
+			double logFMax = Math.log10(AUDIO_SR / 2.0);
+
+			// Считаем суммарный response по всем активным полосам
+			android.graphics.Path path = new android.graphics.Path();
+			boolean first = true;
+			for (int i = 0; i < PLOT_POINTS; i++) {
+				double logF = logFMin + (double) i / (PLOT_POINTS - 1) * (logFMax - logFMin);
+				double freq  = Math.pow(10.0, logF);
+				// Комплексный отклик biquad при частоте freq:
+				// H(z) при z = e^(j*w), w = 2π*f/sr
+				double totalDb = 0.0;
+				synchronized (mEqLock) {
+					for (EqBand b : mEqBands) {
+						if (!b.enabled) continue;
+						double w0 = 2.0 * Math.PI * freq / AUDIO_SR;
+						// z^-1 = e^(-jw0), оцениваем числитель и знаменатель
+						double cosW = Math.cos(w0), sinW = Math.sin(w0);
+						double cos2W = Math.cos(2 * w0), sin2W = Math.sin(2 * w0);
+						// Числитель: b0 + b1*z^-1 + b2*z^-2
+						double numRe = b.b0 + b.b1 * cosW + b.b2 * cos2W;
+						double numIm =      - b.b1 * sinW - b.b2 * sin2W;
+						// Знаменатель: 1 + a1*z^-1 + a2*z^-2
+						double denRe = 1.0  + b.a1 * cosW + b.a2 * cos2W;
+						double denIm =      - b.a1 * sinW - b.a2 * sin2W;
+						double magSq = (numRe*numRe + numIm*numIm) / (denRe*denRe + denIm*denIm);
+						if (magSq > 1e-20) totalDb += 10.0 * Math.log10(magSq);
+					}
+				}
+				float x = (float)(w * (logF - logFMin) / (logFMax - logFMin));
+				float db = (float) Math.max(-DB_RANGE, Math.min(DB_RANGE, totalDb));
+				float y  = midY - plotH / 2f * (db / DB_RANGE);
+				if (first) { path.moveTo(x, y); first = false; }
+				else         path.lineTo(x, y);
+			}
+			canvas.drawPath(path, mCurvePaint);
 		}
 	}
 
@@ -1571,6 +1753,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					obj.put("freq",    b.freq);
 					obj.put("q",       b.q);
 					obj.put("gainDb",  b.gainDb);
+					obj.put("slopeDb", b.slopeDb);
 					arr.put(obj);
 				}
 			}
@@ -1596,6 +1779,27 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mNcHystDb     = p.getFloat("ncHyst", -6.0f);
 		mNcReleaseMs  = p.getInt  ("ncRel",  600);
 		mNcResidual   = p.getFloat("ncRes",  0.0f);
+		// Восстанавливаем позиции слайдеров и подписи
+		if (mSbNcThr != null) {
+			int prog = Math.round((mNcThreshMult - 1.0f) / 0.09f);
+			mSbNcThr.setProgress(prog);
+			mTvNcThr.setText(String.format("Thr:%.1fx", mNcThreshMult));
+		}
+		if (mSbNcHyst != null) {
+			int prog = Math.round((mNcHystDb + 12f) / 0.1f);
+			mSbNcHyst.setProgress(prog);
+			mTvNcHyst.setText(String.format("Hyst:%.0fdB", mNcHystDb));
+		}
+		if (mSbNcRel != null) {
+			int prog = Math.round((mNcReleaseMs - 50) / 29.5f);
+			mSbNcRel.setProgress(prog);
+			mTvNcRel.setText("Rel:" + mNcReleaseMs + "ms");
+		}
+		if (mSbNcRes != null) {
+			int prog = Math.round(mNcResidual * 100f);
+			mSbNcRes.setProgress(prog);
+			mTvNcRes.setText("Res:" + prog + "%");
+		}
 		// ── Gain ─────────────────────────────────────────────────────────────
 		if (mSeekGain != null) mSeekGain.setProgress(p.getInt("gain", 400));
 		// ── Video ─────────────────────────────────────────────────────────────
@@ -1628,6 +1832,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				b.freq    = (float) obj.getDouble("freq");
 				b.q       = (float) obj.getDouble("q");
 				b.gainDb  = (float) obj.getDouble("gainDb");
+				b.slopeDb = (float) obj.optDouble("slopeDb", 6.0);
 				synchronized (mEqLock) { b.computeCoeffs(AUDIO_SR); mEqBands.add(b); }
 				addEqBandRow(b);
 			}
