@@ -205,6 +205,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private CheckBox mCbOsc;   // видимость осциллографа
 	private CheckBox mCbSpec;  // видимость спектра
 
+	// ─── EQ ───────────────────────────────────────────────────────────────────
+	private volatile boolean mEqEnabled = false;
+	private Button mBtnEq;
+	private View mEqPanel;
+	private boolean mEqPanelVisible = false;
+	private final List<EqBand> mEqBands = new ArrayList<>();
+	private final Object mEqLock = new Object();
+	private LinearLayout mEqListView;
+	private CheckBox mCbEqEnable;
+
 	// ─── Аудио-источники ──────────────────────────────────────────────────────
 	private final List<AudioSrcItem> mSrcList = new ArrayList<>();
 
@@ -231,6 +241,68 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			pts = bi.presentationTimeUs; flags = bi.flags;
 		}
 		boolean isKey() { return (flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0; }
+	}
+
+	// ── Biquad EQ band ────────────────────────────────────────────────────────
+	// HPF/LPF — 2nd order Butterworth (Q=1/√2); Peak — standard RBJ peak EQ biquad.
+	// All implemented as Direct Form II Transposed for numerical stability.
+	private static class EqBand {
+		static final int HPF = 0, LPF = 1, PEAK = 2;
+		int     type    = HPF;
+		boolean enabled = true;
+		float   freq    = 1000f;
+		float   q       = 1.0f;
+		float   gainDb  = 0f;
+		// Biquad coefficients (normalized, a0=1):
+		//   y[n] = b0*x[n] + b1*x[n-1] + b2*x[n-2] - a1*y[n-1] - a2*y[n-2]
+		double b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
+		// Per-channel state: index 0=L (or mono), 1=R
+		final double[] x1 = new double[2], x2 = new double[2];
+		final double[] y1 = new double[2], y2 = new double[2];
+
+		void computeCoeffs(int sr) {
+			double f   = Math.max(20.0, Math.min(18000.0, freq));
+			double w0  = 2.0 * Math.PI * f / sr;
+			double cw  = Math.cos(w0), sw = Math.sin(w0);
+			double rb0, rb1, rb2, ra0, ra1, ra2;
+			if (type == HPF) {
+				// 2nd-order Butterworth HPF: Q = 1/√2
+				double alpha = sw / Math.sqrt(2.0); // sw / (2*Q) with Q=1/√2
+				rb0 =  (1.0 + cw) / 2.0;
+				rb1 = -(1.0 + cw);
+				rb2 =  (1.0 + cw) / 2.0;
+				ra0 =   1.0 + alpha;
+				ra1 =  -2.0 * cw;
+				ra2 =   1.0 - alpha;
+			} else if (type == LPF) {
+				// 2nd-order Butterworth LPF: Q = 1/√2
+				double alpha = sw / Math.sqrt(2.0);
+				rb0 =  (1.0 - cw) / 2.0;
+				rb1 =   1.0 - cw;
+				rb2 =  (1.0 - cw) / 2.0;
+				ra0 =   1.0 + alpha;
+				ra1 =  -2.0 * cw;
+				ra2 =   1.0 - alpha;
+			} else {
+				// Peak EQ biquad (RBJ cookbook)
+				double Q = Math.max(0.1, q);
+				double A = Math.pow(10.0, gainDb / 40.0);
+				double alpha = sw / (2.0 * Q);
+				rb0 =  1.0 + alpha * A;
+				rb1 = -2.0 * cw;
+				rb2 =  1.0 - alpha * A;
+				ra0 =  1.0 + alpha / A;
+				ra1 = -2.0 * cw;
+				ra2 =  1.0 - alpha / A;
+			}
+			b0 = rb0 / ra0; b1 = rb1 / ra0; b2 = rb2 / ra0;
+			a1 = ra1 / ra0; a2 = ra2 / ra0;
+		}
+
+		void resetState() {
+			java.util.Arrays.fill(x1, 0); java.util.Arrays.fill(x2, 0);
+			java.util.Arrays.fill(y1, 0); java.util.Arrays.fill(y2, 0);
+		}
 	}
 	private final java.util.ArrayDeque<EncodedFrame> mVidRing = new java.util.ArrayDeque<>();
 	private final java.util.ArrayDeque<EncodedFrame> mAudRing = new java.util.ArrayDeque<>();
@@ -535,6 +607,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			mAudioSrcPanel.setVisibility(mAudioSrcExpanded ? View.VISIBLE : View.GONE);
 			mSrcToggleBtn.setText(mAudioSrcExpanded ? "⚙ ▴" : "⚙");
 		});
+
+		// EQ кнопка — справа от шестерёнки
+		mBtnEq = new Button(this);
+		mBtnEq.setText("EQ");
+		mBtnEq.setAllCaps(false);
+		mBtnEq.setTextSize(14);
+		mBtnEq.setTextColor(0xFFBBBBBB);
+		mBtnEq.setBackground(null);
+		mBtnEq.setPadding(dp(4), 0, dp(8), 0);
+		mBtnEq.setOnClickListener(v -> {
+			mEqPanelVisible = !mEqPanelVisible;
+			mEqPanel.setVisibility(mEqPanelVisible ? View.VISIBLE : View.GONE);
+			mBtnEq.setText(mEqPanelVisible ? "EQ ▴" : "EQ");
+		});
 		
 		mTvStatus = new TextView(this);
 		mTvStatus.setTextColor(0xFFAAAAAA);
@@ -543,8 +629,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mTvStatus.setSingleLine(false);
 		mTvStatus.setMaxLines(2);
 		mTvStatus.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-		// Шестерёнка слева, статус справа (weight=1)
-		panel.addView(hrow(mSrcToggleBtn, mTvStatus));
+		// Шестерёнка слева, EQ рядом, статус справа (weight=1)
+		panel.addView(hrow(mSrcToggleBtn, mBtnEq, mTvStatus));
 		
 		// Схлопываемая панель: спиннер + soft clip + manual focus
 		// Центрируем по экрану — слайдер Gain слева не перекрывает
@@ -990,9 +1076,306 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		pauseLP.bottomMargin = recBottom + recSize + dp(6);
 		root.addView(mBtnPause, pauseLP);
 
+		// ── EQ panel (оверлей поверх превью, от верха экрана вниз — выше спектра) ──
+		mEqPanel = buildEqPanel();
+		mEqPanel.setVisibility(View.GONE);
+		FrameLayout.LayoutParams eqLP = new FrameLayout.LayoutParams(
+			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+		eqLP.gravity = Gravity.TOP;
+		eqLP.leftMargin  = dp(58); // не перекрывать Gain + VU
+		eqLP.rightMargin = dp(54); // не перекрывать Zoom-рычаг
+		root.addView(mEqPanel, eqLP);
+
 		return root;
 	}
 	
+	// =========================================================================
+	// EQ panel builder
+	// =========================================================================
+
+	private View buildEqPanel() {
+		LinearLayout panel = new LinearLayout(this);
+		panel.setOrientation(LinearLayout.VERTICAL);
+		panel.setBackgroundColor(0xF0181818);
+		panel.setPadding(dp(8), dp(4), dp(8), dp(8));
+
+		// ── Заголовок: EQ [ON] [+] [✕] ──────────────────────────────────────
+		LinearLayout header = new LinearLayout(this);
+		header.setOrientation(LinearLayout.HORIZONTAL);
+		header.setGravity(Gravity.CENTER_VERTICAL);
+
+		TextView tvTitle = new TextView(this);
+		tvTitle.setText("EQUALIZER");
+		tvTitle.setTextColor(0xFF88DDFF);
+		tvTitle.setTextSize(12);
+		tvTitle.setTypeface(null, android.graphics.Typeface.BOLD);
+		LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+		header.addView(tvTitle, tlp);
+
+		mCbEqEnable = new CheckBox(this);
+		mCbEqEnable.setText("ON");
+		mCbEqEnable.setTextColor(0xCCCCCCCC);
+		mCbEqEnable.setTextSize(11);
+		mCbEqEnable.setChecked(mEqEnabled);
+		mCbEqEnable.setOnCheckedChangeListener((v, on) -> mEqEnabled = on);
+		header.addView(mCbEqEnable);
+
+		// Кнопка "+" — добавить фильтр
+		Button btnAdd = new Button(this);
+		btnAdd.setText("+");
+		btnAdd.setTextSize(18);
+		btnAdd.setTextColor(0xFF88FF88);
+		btnAdd.setBackground(null);
+		btnAdd.setPadding(dp(10), 0, dp(10), 0);
+		btnAdd.setOnClickListener(v -> {
+			new android.app.AlertDialog.Builder(this)
+				.setTitle("Add filter")
+				.setItems(new String[]{"HPF  (High Pass, −12 dB/oct)", "LPF  (Low Pass, −12 dB/oct)", "Peak (Bell ±12 dB)"}, (d, which) -> {
+					EqBand band = new EqBand();
+					band.type    = which;
+					band.freq    = (which == EqBand.HPF) ? 80f : (which == EqBand.LPF) ? 8000f : 1000f;
+					band.q       = 1.0f;
+					band.gainDb  = 0f;
+					band.enabled = true;
+					synchronized (mEqLock) {
+						band.computeCoeffs(AUDIO_SR);
+						mEqBands.add(band);
+					}
+					addEqBandRow(band);
+				})
+				.show();
+		});
+		header.addView(btnAdd);
+
+		// Кнопка закрытия
+		Button btnClose = new Button(this);
+		btnClose.setText("✕");
+		btnClose.setTextSize(14);
+		btnClose.setTextColor(0xFFAAAAAA);
+		btnClose.setBackground(null);
+		btnClose.setPadding(dp(6), 0, dp(2), 0);
+		btnClose.setOnClickListener(v -> {
+			mEqPanelVisible = false;
+			mEqPanel.setVisibility(View.GONE);
+			mBtnEq.setText("EQ");
+		});
+		header.addView(btnClose);
+		panel.addView(header, new LinearLayout.LayoutParams(
+			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+		// Разделитель
+		View div = new View(this);
+		div.setBackgroundColor(0x44FFFFFF);
+		panel.addView(div, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1));
+
+		// ── Прокручиваемый список фильтров ────────────────────────────────────
+		ScrollView sv = new ScrollView(this) {
+			@Override protected void onMeasure(int wMs, int hMs) {
+				// Ограничиваем высоту списка: не более 55% высоты экрана
+				int maxH = (int)(getResources().getDisplayMetrics().heightPixels * 0.55f);
+				super.onMeasure(wMs, MeasureSpec.makeMeasureSpec(maxH, MeasureSpec.AT_MOST));
+			}
+		};
+		mEqListView = new LinearLayout(this);
+		mEqListView.setOrientation(LinearLayout.VERTICAL);
+		sv.addView(mEqListView, new LinearLayout.LayoutParams(
+			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+		panel.addView(sv, new LinearLayout.LayoutParams(
+			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+		return panel;
+	}
+
+	/** Добавляет строку фильтра в mEqListView. Вызывается из UI-треда. */
+	private void addEqBandRow(EqBand band) {
+		final String[] typeNames = {"HPF", "LPF", "PEAK"};
+
+		LinearLayout row = new LinearLayout(this);
+		row.setOrientation(LinearLayout.VERTICAL);
+		row.setBackgroundColor(0x22FFFFFF);
+		row.setPadding(dp(4), dp(3), dp(4), dp(4));
+		LinearLayout.LayoutParams rowLP = new LinearLayout.LayoutParams(
+			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+		rowLP.topMargin = dp(4);
+		row.setLayoutParams(rowLP);
+
+		// ── Строка 1: [HPF] [✓ ON] [F: -------- 1000 Hz] [✕] ──────────────
+		LinearLayout top = new LinearLayout(this);
+		top.setOrientation(LinearLayout.HORIZONTAL);
+		top.setGravity(Gravity.CENTER_VERTICAL);
+
+		TextView tvType = new TextView(this);
+		tvType.setText(typeNames[band.type]);
+		tvType.setTextColor(0xFF88DDFF);
+		tvType.setTextSize(11);
+		tvType.setTypeface(null, android.graphics.Typeface.BOLD);
+		tvType.setMinWidth(dp(34));
+		top.addView(tvType);
+
+		CheckBox cbEn = new CheckBox(this);
+		cbEn.setText("ON");
+		cbEn.setTextColor(0xCCCCCCCC);
+		cbEn.setTextSize(11);
+		cbEn.setChecked(band.enabled);
+		cbEn.setOnCheckedChangeListener((v, on) -> { synchronized (mEqLock) { band.enabled = on; } });
+		top.addView(cbEn);
+
+		TextView tvFL = new TextView(this);
+		tvFL.setText("F:");
+		tvFL.setTextColor(0xCCCCCCCC);
+		tvFL.setTextSize(11);
+		top.addView(tvFL);
+
+		SeekBar sbFreq = new SeekBar(this);
+		sbFreq.setMax(100);
+		sbFreq.setProgress(eqFreqToProgress(band.freq));
+		sbFreq.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+		top.addView(sbFreq);
+
+		final TextView tvFreq = new TextView(this);
+		tvFreq.setText(eqFormatFreq(band.freq));
+		tvFreq.setTextColor(0xFFDDDDDD);
+		tvFreq.setTextSize(11);
+		tvFreq.setMinWidth(dp(54));
+		top.addView(tvFreq);
+
+		Button btnDel = new Button(this);
+		btnDel.setText("✕");
+		btnDel.setTextSize(12);
+		btnDel.setTextColor(0xFFFF4444);
+		btnDel.setBackground(null);
+		btnDel.setPadding(dp(6), 0, dp(2), 0);
+		btnDel.setOnClickListener(v -> {
+			synchronized (mEqLock) { mEqBands.remove(band); }
+			mEqListView.removeView(row);
+		});
+		top.addView(btnDel);
+		row.addView(top, new LinearLayout.LayoutParams(
+			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+		sbFreq.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+			public void onProgressChanged(SeekBar s, int p, boolean u) {
+				float f = eqProgressToFreq(p);
+				tvFreq.setText(eqFormatFreq(f));
+				synchronized (mEqLock) { band.freq = f; band.computeCoeffs(AUDIO_SR); band.resetState(); }
+			}
+			public void onStartTrackingTouch(SeekBar s) {}
+			public void onStopTrackingTouch(SeekBar s) {}
+		});
+
+		// ── Peak: строки Q и Gain ─────────────────────────────────────────────
+		if (band.type == EqBand.PEAK) {
+			// Q row
+			LinearLayout qRow = new LinearLayout(this);
+			qRow.setOrientation(LinearLayout.HORIZONTAL);
+			qRow.setGravity(Gravity.CENTER_VERTICAL);
+
+			TextView tvQL = new TextView(this);
+			tvQL.setText("Q:");
+			tvQL.setTextColor(0xCCCCCCCC);
+			tvQL.setTextSize(11);
+			tvQL.setMinWidth(dp(34));
+			qRow.addView(tvQL);
+
+			SeekBar sbQ = new SeekBar(this);
+			sbQ.setMax(100);
+			sbQ.setProgress(Math.round((band.q - 0.1f) / 3.9f * 100f));
+			sbQ.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+			qRow.addView(sbQ);
+
+			final TextView tvQ = new TextView(this);
+			tvQ.setText(String.format("%.2f", band.q));
+			tvQ.setTextColor(0xFFDDDDDD);
+			tvQ.setTextSize(11);
+			tvQ.setMinWidth(dp(54));
+			qRow.addView(tvQ);
+			// spacer to align with btnDel column
+			TextView tvQSp = new TextView(this); tvQSp.setText("  "); qRow.addView(tvQSp);
+			row.addView(qRow, new LinearLayout.LayoutParams(
+				ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+			sbQ.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+				public void onProgressChanged(SeekBar s, int p, boolean u) {
+					float qv = 0.1f + p * 3.9f / 100f;
+					tvQ.setText(String.format("%.2f", qv));
+					synchronized (mEqLock) { band.q = qv; band.computeCoeffs(AUDIO_SR); band.resetState(); }
+				}
+				public void onStartTrackingTouch(SeekBar s) {}
+				public void onStopTrackingTouch(SeekBar s) {}
+			});
+
+			// Gain row
+			LinearLayout gRow = new LinearLayout(this);
+			gRow.setOrientation(LinearLayout.HORIZONTAL);
+			gRow.setGravity(Gravity.CENTER_VERTICAL);
+
+			TextView tvGL = new TextView(this);
+			tvGL.setText("dB:");
+			tvGL.setTextColor(0xCCCCCCCC);
+			tvGL.setTextSize(11);
+			tvGL.setMinWidth(dp(34));
+			gRow.addView(tvGL);
+
+			SeekBar sbGain = new SeekBar(this);
+			sbGain.setMax(48); // −12..+12 dB, шаг 0.5 dB
+			sbGain.setProgress(Math.round((band.gainDb + 12f) * 2f));
+			sbGain.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+			gRow.addView(sbGain);
+
+			final TextView tvGain = new TextView(this);
+			tvGain.setText(String.format("%+.1f dB", band.gainDb));
+			tvGain.setTextColor(0xFFDDDDDD);
+			tvGain.setTextSize(11);
+			tvGain.setMinWidth(dp(54));
+			gRow.addView(tvGain);
+			TextView tvGSp = new TextView(this); tvGSp.setText("  "); gRow.addView(tvGSp);
+			row.addView(gRow, new LinearLayout.LayoutParams(
+				ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+			sbGain.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+				public void onProgressChanged(SeekBar s, int p, boolean u) {
+					float gdb = -12f + p * 0.5f;
+					tvGain.setText(String.format("%+.1f dB", gdb));
+					synchronized (mEqLock) { band.gainDb = gdb; band.computeCoeffs(AUDIO_SR); band.resetState(); }
+				}
+				public void onStartTrackingTouch(SeekBar s) {}
+				public void onStopTrackingTouch(SeekBar s) {}
+			});
+		}
+
+		mEqListView.addView(row);
+	}
+
+	// Логарифмическая шкала частот: 20 Гц .. 18 кГц (progress 0..100)
+	private static int eqFreqToProgress(float freq) {
+		return (int) Math.round(100.0 * Math.log(Math.max(20f, freq) / 20.0) / Math.log(900.0));
+	}
+	private static float eqProgressToFreq(int p) {
+		return 20f * (float) Math.pow(900.0, p / 100.0);
+	}
+	private static String eqFormatFreq(float hz) {
+		return hz >= 1000f ? String.format("%.1f kHz", hz / 1000f) : String.format("%.0f Hz", hz);
+	}
+
+	/** Применяет цепочку biquad-фильтров к PCM-буферу (in-place). */
+	private void applyEq(short[] buf, int r, int ch) {
+		synchronized (mEqLock) {
+			for (EqBand b : mEqBands) {
+				if (!b.enabled) continue;
+				for (int i = 0; i < r; i++) {
+					int c = (ch > 1) ? (i & 1) : 0; // 0=L/mono, 1=R
+					double x = buf[i];
+					double y = b.b0 * x + b.b1 * b.x1[c] + b.b2 * b.x2[c]
+					         - b.a1 * b.y1[c] - b.a2 * b.y2[c];
+					b.x2[c] = b.x1[c]; b.x1[c] = x;
+					b.y2[c] = b.y1[c]; b.y1[c] = y;
+					float s = (float) y;
+					buf[i] = (short)(s > 32767f ? 32767 : (s < -32768f ? -32768 : (int) s));
+				}
+			}
+		}
+	}
+
 	/** Строит колонку с барабаном фокуса (как кольцо на настоящей камере) */
 	private View buildFocusColumn() {
 		FrameLayout col = new FrameLayout(this);
@@ -1176,6 +1559,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		// ── Visibility toggles ────────────────────────────────────────────────
 		if (mCbOsc != null) e.putBoolean("showOsc", mCbOsc.isChecked());
 		if (mCbSpec != null) e.putBoolean("showSpec", mCbSpec.isChecked());
+		// ── EQ chain ──────────────────────────────────────────────────────────
+		e.putBoolean("eqEnabled", mEqEnabled);
+		try {
+			org.json.JSONArray arr = new org.json.JSONArray();
+			synchronized (mEqLock) {
+				for (EqBand b : mEqBands) {
+					org.json.JSONObject obj = new org.json.JSONObject();
+					obj.put("type",    b.type);
+					obj.put("enabled", b.enabled);
+					obj.put("freq",    b.freq);
+					obj.put("q",       b.q);
+					obj.put("gainDb",  b.gainDb);
+					arr.put(obj);
+				}
+			}
+			e.putString("eqChain", arr.toString());
+		} catch (Exception ignored) {}
 		e.apply();
 	}
 
@@ -1212,6 +1612,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		// ── Visibility ────────────────────────────────────────────────────────
 		if (mCbOsc  != null) mCbOsc.setChecked(p.getBoolean("showOsc",  true));
 		if (mCbSpec != null) mCbSpec.setChecked(p.getBoolean("showSpec", true));
+		// ── EQ chain ──────────────────────────────────────────────────────────
+		mEqEnabled = p.getBoolean("eqEnabled", false);
+		if (mCbEqEnable != null) mCbEqEnable.setChecked(mEqEnabled);
+		try {
+			String eqJson = p.getString("eqChain", "[]");
+			org.json.JSONArray arr = new org.json.JSONArray(eqJson);
+			synchronized (mEqLock) { mEqBands.clear(); }
+			if (mEqListView != null) mEqListView.removeAllViews();
+			for (int i = 0; i < arr.length(); i++) {
+				org.json.JSONObject obj = arr.getJSONObject(i);
+				EqBand b = new EqBand();
+				b.type    = obj.getInt("type");
+				b.enabled = obj.getBoolean("enabled");
+				b.freq    = (float) obj.getDouble("freq");
+				b.q       = (float) obj.getDouble("q");
+				b.gainDb  = (float) obj.getDouble("gainDb");
+				synchronized (mEqLock) { b.computeCoeffs(AUDIO_SR); mEqBands.add(b); }
+				addEqBandRow(b);
+			}
+		} catch (Exception ignored) {}
 	}
 
 	private void showAirplaneModeReminder() {
@@ -1891,10 +2311,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			}
 
 			// ── Custom NC: DSP-шумоподавление по оценке шумового пола ────────
-			// ── WAV sidecar: пишем сырой PCM (до NC) ────────────────────────
+			// ── WAV sidecar: пишем сырой PCM (до EQ и NC) ───────────────────
 			if (mRecordWav) {
 				handlePcmForWav(buf, r, startUs + totalFrames * 1_000_000L / AUDIO_SR);
 			}
+
+			// ── EQ: бiquad-цепочка (после WAV, до NC) ────────────────────────
+			if (mEqEnabled) applyEq(buf, r, ch);
 
 			// ── Custom NC (модифицирует buf in-place) ────────────────────────
 			if (mCustomNcEnabled) applyCustomNc(buf, r);
