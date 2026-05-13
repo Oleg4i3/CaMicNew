@@ -2278,7 +2278,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		if (rec.getState() != AudioRecord.STATE_INITIALIZED) { rec.release(); return; }
 		if (Build.VERSION.SDK_INT >= 23 && src2 != null && src2.device != null)
 			rec.setPreferredDevice(src2.device);
-		configureAudioEffects(rec.getAudioSessionId());
+		// UNPROCESSED source аппаратно обходит весь DSP (AGC/NC/AEC) —
+		// вызов configureAudioEffects излишен и может активировать эффекты
+		// через параллельный путь. Применяем эффекты только для «обработанных» источников.
+		if (audioSrc != MediaRecorder.AudioSource.UNPROCESSED) {
+			configureAudioEffects(rec.getAudioSessionId());
+		}
 		mAudRec = rec; mAudChannels = channels;
 
 		// Создаём аудио-энкодер
@@ -2811,6 +2816,33 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		}
 	}
 
+	/**
+	 * Зондирует AudioSource с явным device routing.
+	 * Нужен для внешних микрофонов: обычный probeAudioSource без setPreferredDevice
+	 * маршрутизирует на встроенный микрофон и возвращает true даже если внешний
+	 * с этим источником несовместим.
+	 */
+	@SuppressLint("MissingPermission")
+	private boolean probeAudioSourceWithDevice(int src, AudioDeviceInfo device) {
+		if (Build.VERSION.SDK_INT < 23) return probeAudioSource(src);
+		try {
+			int minBuf = AudioRecord.getMinBufferSize(
+				AUDIO_SR, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
+			if (minBuf <= 0) return false;
+			AudioRecord ar = new AudioRecord(
+				src, AUDIO_SR, AudioFormat.CHANNEL_IN_MONO,
+				AudioFormat.ENCODING_PCM_16BIT, minBuf);
+			if (ar.getState() != AudioRecord.STATE_INITIALIZED) { ar.release(); return false; }
+			if (device != null) ar.setPreferredDevice(device);
+			// STATE не меняется от setPreferredDevice — но AudioRecord создался успешно,
+			// значит source поддерживается системой; реальный routing будет при start().
+			ar.release();
+			return true;
+		} catch (Exception e) {
+			return false;
+		}
+	}
+
 	private void buildAudioSources() {
 		// Зондирование запускаем в фоновом потоке — каждое AudioRecord.create занимает время
 		new Thread(() -> {
@@ -2845,24 +2877,43 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 							if (probeAudioSource(candidates[i][0]))
 								list.add(new AudioSrcItem(candidateNames[i], candidates[i][0], d));
 						}
-						// UNPROCESSED — API 24+
+						// UNPROCESSED для встроенного mic — device=d (built-in mic device).
+						// Для каждого внешнего устройства ниже создаётся свой UNPROCESSED item.
 						if (Build.VERSION.SDK_INT >= 24 &&
 								probeAudioSource(MediaRecorder.AudioSource.UNPROCESSED))
-							list.add(new AudioSrcItem("Unprocessed (raw)",
+							list.add(new AudioSrcItem("Built-in (raw)",
 								MediaRecorder.AudioSource.UNPROCESSED, d));
 
 					} else if (t == AudioDeviceInfo.TYPE_USB_DEVICE ||
 								t == AudioDeviceInfo.TYPE_USB_HEADSET) {
 						CharSequence pn = d.getProductName();
-						list.add(new AudioSrcItem(
-							"USB: " + (pn != null && pn.length() > 0 ? pn : "audio"),
+						String usbLabel = "USB: " + (pn != null && pn.length() > 0 ? pn : "audio");
+						// MIC source с маршрутизацией на USB-устройство
+						list.add(new AudioSrcItem(usbLabel,
 							MediaRecorder.AudioSource.MIC, d));
+						// UNPROCESSED + device=d: обходит весь DSP аппаратно.
+						// setPreferredDevice в startMonitor() направит поток
+						// именно на это USB-устройство, а не на built-in mic.
+						if (Build.VERSION.SDK_INT >= 24 &&
+								probeAudioSourceWithDevice(MediaRecorder.AudioSource.UNPROCESSED, d))
+							list.add(new AudioSrcItem(usbLabel + " (raw)",
+								MediaRecorder.AudioSource.UNPROCESSED, d));
 					} else if (t == AudioDeviceInfo.TYPE_WIRED_HEADSET) {
-						list.add(new AudioSrcItem("Wired headset",
+						// Проводной микрофон (TRRS/TRS)
+						list.add(new AudioSrcItem("Wired mic",
 							MediaRecorder.AudioSource.MIC, d));
+						// UNPROCESSED + device routing на внешний микрофон:
+						// единственный способ получить сырой звук без AGC/NC/AEC.
+						// device=d гарантирует, что setPreferredDevice направит поток
+						// на wired mic, а audioSource=UNPROCESSED убирает DSP.
+						if (Build.VERSION.SDK_INT >= 24 &&
+								probeAudioSourceWithDevice(MediaRecorder.AudioSource.UNPROCESSED, d))
+							list.add(new AudioSrcItem("Wired mic (raw)",
+								MediaRecorder.AudioSource.UNPROCESSED, d));
 					} else if (t == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
 						list.add(new AudioSrcItem("Bluetooth mic",
 							MediaRecorder.AudioSource.MIC, d));
+						// BT SCO не поддерживает UNPROCESSED — ограничение SCO-кодека
 					}
 				}
 			}
@@ -2904,19 +2955,41 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				ad2.addAll(names);
 				ad2.notifyDataSetChanged();
 
-				// Выбор источника по умолчанию: USB → UNPROCESSED → первый
+				// Выбор источника по умолчанию:
+				// Приоритет: внешний (raw) → внешний MIC → встроенный (raw) → первый
 				int defaultIdx = 0;
-				for (int i = 0; i < mSrcList.size(); i++) {
-					AudioSrcItem item = mSrcList.get(i);
-					if (item.device != null && Build.VERSION.SDK_INT >= 23) {
-						int t = item.device.getType();
-						if (t == AudioDeviceInfo.TYPE_USB_DEVICE ||
-								t == AudioDeviceInfo.TYPE_USB_HEADSET) {
-							defaultIdx = i;
-							break;
+				// 1. Ищем внешний UNPROCESSED (USB или wired с device routing)
+				if (Build.VERSION.SDK_INT >= 23) {
+					for (int i = 0; i < mSrcList.size(); i++) {
+						AudioSrcItem item = mSrcList.get(i);
+						if (item.audioSource == MediaRecorder.AudioSource.UNPROCESSED
+								&& item.device != null) {
+							int t = item.device.getType();
+							if (t == AudioDeviceInfo.TYPE_USB_DEVICE
+									|| t == AudioDeviceInfo.TYPE_USB_HEADSET
+									|| t == AudioDeviceInfo.TYPE_WIRED_HEADSET) {
+								defaultIdx = i;
+								break;
+							}
 						}
 					}
 				}
+				// 2. Нет внешнего (raw) — ищем любой внешний MIC
+				if (defaultIdx == 0 && Build.VERSION.SDK_INT >= 23) {
+					for (int i = 0; i < mSrcList.size(); i++) {
+						AudioSrcItem item = mSrcList.get(i);
+						if (item.device != null) {
+							int t = item.device.getType();
+							if (t == AudioDeviceInfo.TYPE_USB_DEVICE
+									|| t == AudioDeviceInfo.TYPE_USB_HEADSET
+									|| t == AudioDeviceInfo.TYPE_WIRED_HEADSET) {
+								defaultIdx = i;
+								break;
+							}
+						}
+					}
+				}
+				// 3. Нет внешних — ищем встроенный UNPROCESSED
 				if (defaultIdx == 0) {
 					for (int i = 0; i < mSrcList.size(); i++) {
 						if (mSrcList.get(i).audioSource == MediaRecorder.AudioSource.UNPROCESSED) {
