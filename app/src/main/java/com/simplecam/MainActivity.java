@@ -1902,6 +1902,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	}
 
 	private static final String P = "cam_prefs";
+
+	private void showAirplaneModeReminder() {
+		new android.app.AlertDialog.Builder(this)
+			.setTitle("\u2708  Airplane Mode recommended")
+			.setMessage(
+				"For distraction-free recording:\n\n" +
+				"  \u2022  Turn on Airplane Mode\n\n" +
+				"This prevents calls, notifications\n" +
+				"and Wi-Fi interruptions during recording.\n\n" +
+				"(Screen will stay on while the app is open.)")
+			.setPositiveButton("Got it", null)
+			.setNegativeButton("\u2753 Help", (d, w) -> showHelp())
+			.setNeutralButton("Open Settings", (d, w) -> {
+				try {
+					startActivity(new android.content.Intent(
+						android.provider.Settings.ACTION_AIRPLANE_MODE_SETTINGS));
+				} catch (Exception ignored) {}
+			})
+			.show();
+	}
 	private void savePrefs() {
 		android.content.SharedPreferences.Editor e =
 			getSharedPreferences(P, 0).edit();
