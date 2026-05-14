@@ -81,6 +81,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private CheckBox mCbSoftClip, mCbManualFocus, mCbFocusAssist, mCbEis;
 	private boolean mAudioSrcExpanded = false;
 	private View mFocusColumn; // контейнер слайдера фокуса
+	/** Постоянный оверлей «NC / CUST.NC» поверх спектра — виден при свёрнутых настройках. */
+	private TextView mTvNcOverlay;
 	
 	// Focus Assist: сохранённый зум до ассиста и хэндлер восстановления
 	private volatile float mSavedZoomBeforeAssist = 1f;
@@ -935,6 +937,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 						mNcLevelRow.setVisibility((on || mCustomNcEnabled) ? View.VISIBLE : View.GONE);
 					updateNcLevelLabel();
 					applyAudioEffects();
+					updateNcOverlay();
 				});
 				fxRow.addView(mCbNc);
 			}
@@ -951,6 +954,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				if (mNcLevelRow != null)
 					mNcLevelRow.setVisibility((on || mNcEnabled) ? View.VISIBLE : View.GONE);
 				updateNcLevelLabel();
+				updateNcOverlay();
 			});
 			fxRow.addView(mCbCustomNc);
 
@@ -1069,6 +1073,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				ViewGroup.LayoutParams.MATCH_PARENT, dp(72), Gravity.BOTTOM);
 		eqOvLP.rightMargin = dp(120);
 		specFrame.addView(mEqOverlay, eqOvLP);
+		// NC status overlay — поверх спектра, виден даже при свёрнутых настройках.
+		// Показывает «NC» / «CUST.NC» / «NC  CUST.NC» когда шумоподавление активно.
+		mTvNcOverlay = new TextView(this);
+		mTvNcOverlay.setTextColor(0xFFFF7744);
+		mTvNcOverlay.setTextSize(9);
+		mTvNcOverlay.setTypeface(null, android.graphics.Typeface.BOLD);
+		mTvNcOverlay.setVisibility(View.GONE);
+		android.widget.FrameLayout.LayoutParams ncOvLP =
+			new android.widget.FrameLayout.LayoutParams(
+				ViewGroup.LayoutParams.WRAP_CONTENT,
+				ViewGroup.LayoutParams.WRAP_CONTENT,
+				Gravity.BOTTOM | Gravity.LEFT);
+		ncOvLP.leftMargin  = dp(4);
+		ncOvLP.bottomMargin = dp(32); // не перекрывать нижний край спектра
+		specFrame.addView(mTvNcOverlay, ncOvLP);
 		// Настройки — поверх (сверху), поэтому addView после спектра
 		specFrame.addView(mAudioSrcPanel, new android.widget.FrameLayout.LayoutParams(
 			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -1148,7 +1167,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mCbEqEnable.setTextColor(0xCCCCCCCC);
 		mCbEqEnable.setTextSize(11);
 		mCbEqEnable.setChecked(mEqEnabled);
-		mCbEqEnable.setOnCheckedChangeListener((v, on) -> mEqEnabled = on);
+		mCbEqEnable.setOnCheckedChangeListener((v, on) -> {
+			mEqEnabled = on;
+			if (mEqOverlay != null) mEqOverlay.refresh();
+		});
 		header.addView(mCbEqEnable);
 
 		// Кнопка "+" — добавить фильтр
@@ -1204,6 +1226,33 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		});
 		header.addView(btnClose);
 		panel.addView(header, new LinearLayout.LayoutParams(
+			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+		// ── Строка Save / Load config ─────────────────────────────────────────
+		LinearLayout cfgRow = new LinearLayout(this);
+		cfgRow.setOrientation(LinearLayout.HORIZONTAL);
+		cfgRow.setGravity(Gravity.CENTER_VERTICAL);
+		cfgRow.setPadding(0, dp(3), 0, dp(3));
+
+		Button btnSaveCfg = new Button(this);
+		btnSaveCfg.setText("💾 Save config");
+		btnSaveCfg.setTextSize(11);
+		btnSaveCfg.setTextColor(0xFFAADDFF);
+		btnSaveCfg.setBackground(null);
+		btnSaveCfg.setPadding(dp(4), dp(2), dp(14), dp(2));
+		btnSaveCfg.setOnClickListener(v -> saveEqConfig());
+		cfgRow.addView(btnSaveCfg);
+
+		Button btnLoadCfg = new Button(this);
+		btnLoadCfg.setText("📂 Load config");
+		btnLoadCfg.setTextSize(11);
+		btnLoadCfg.setTextColor(0xFFAADDFF);
+		btnLoadCfg.setBackground(null);
+		btnLoadCfg.setPadding(dp(4), dp(2), dp(4), dp(2));
+		btnLoadCfg.setOnClickListener(v -> loadEqConfig());
+		cfgRow.addView(btnLoadCfg);
+
+		panel.addView(cfgRow, new LinearLayout.LayoutParams(
 			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
 		// Разделитель
@@ -1711,6 +1760,147 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			.show();
 	}
 
+	// =========================================================================
+	// NC overlay update
+	// =========================================================================
+
+	/** Обновляет постоянный оверлей «NC / CUST.NC» над спектром. */
+	private void updateNcOverlay() {
+		if (mTvNcOverlay == null) return;
+		boolean sysNc  = mNcEnabled;
+		boolean custNc = mCustomNcEnabled;
+		if (!sysNc && !custNc) {
+			mTvNcOverlay.setVisibility(View.GONE);
+		} else {
+			StringBuilder sb = new StringBuilder();
+			if (sysNc)  sb.append("NC");
+			if (custNc) { if (sb.length() > 0) sb.append("  "); sb.append("CUST.NC"); }
+			mTvNcOverlay.setText(sb.toString());
+			mTvNcOverlay.setVisibility(View.VISIBLE);
+		}
+	}
+
+	// =========================================================================
+	// EQ config save / load
+	// =========================================================================
+
+	/**
+	 * Сохраняет текущую цепочку EQ-фильтров в JSON-файл.
+	 * Показывает AlertDialog с полем ввода имени пресета.
+	 * Файлы хранятся в getExternalFilesDir(null) — доступны без рут,
+	 * видны при подключении USB (MTP).
+	 */
+	private void saveEqConfig() {
+		android.widget.EditText et = new android.widget.EditText(this);
+		et.setHint("Preset name");
+		et.setInputType(android.text.InputType.TYPE_CLASS_TEXT);
+		et.setPadding(dp(16), dp(8), dp(16), dp(8));
+		new android.app.AlertDialog.Builder(this)
+			.setTitle("Save EQ config")
+			.setView(et)
+			.setPositiveButton("Save", (d, w) -> {
+				String name = et.getText().toString().trim();
+				if (name.isEmpty()) name = "eq_config";
+				// Убираем недопустимые символы для имени файла
+				name = name.replaceAll("[^a-zA-Z0-9_\\-]", "_");
+				try {
+					org.json.JSONArray arr = new org.json.JSONArray();
+					synchronized (mEqLock) {
+						for (EqBand b : mEqBands) {
+							org.json.JSONObject obj = new org.json.JSONObject();
+							obj.put("type",    b.type);
+							obj.put("enabled", b.enabled);
+							obj.put("freq",    b.freq);
+							obj.put("q",       b.q);
+							obj.put("gainDb",  b.gainDb);
+							obj.put("slopeDb", b.slopeDb);
+							arr.put(obj);
+						}
+					}
+					org.json.JSONObject root = new org.json.JSONObject();
+					root.put("eqEnabled", mEqEnabled);
+					root.put("bands", arr);
+					java.io.File dir = getExternalFilesDir(null);
+					if (dir == null) dir = getFilesDir();
+					if (!dir.exists()) dir.mkdirs();
+					java.io.File f = new java.io.File(dir, name + ".json");
+					java.io.FileWriter fw = new java.io.FileWriter(f);
+					fw.write(root.toString(2));
+					fw.close();
+					status("EQ saved: " + f.getName());
+				} catch (Exception ex) {
+					status("Save failed: " + ex.getMessage());
+				}
+			})
+			.setNegativeButton("Cancel", null)
+			.show();
+	}
+
+	/**
+	 * Загружает цепочку EQ-фильтров из ранее сохранённого JSON-файла.
+	 * Показывает список .json файлов из getExternalFilesDir(null).
+	 */
+	private void loadEqConfig() {
+		java.io.File dir = getExternalFilesDir(null);
+		if (dir == null) dir = getFilesDir();
+		java.io.File[] files = dir.listFiles((d, n) -> n.endsWith(".json"));
+		if (files == null || files.length == 0) {
+			new android.app.AlertDialog.Builder(this)
+				.setTitle("Load EQ config")
+				.setMessage("No saved configs found.\nSave a config first using 💾 Save config.")
+				.setPositiveButton("OK", null)
+				.show();
+			return;
+		}
+		// Сортируем по дате изменения (новейший первый)
+		java.util.Arrays.sort(files, (a, b) -> Long.compare(b.lastModified(), a.lastModified()));
+		String[] names = new String[files.length];
+		for (int i = 0; i < files.length; i++) {
+			String n = files[i].getName();
+			names[i] = n.endsWith(".json") ? n.substring(0, n.length() - 5) : n;
+		}
+		final java.io.File[] filesRef = files;
+		new android.app.AlertDialog.Builder(this)
+			.setTitle("Load EQ config")
+			.setItems(names, (d, which) -> {
+				try {
+					java.io.BufferedReader br = new java.io.BufferedReader(
+						new java.io.FileReader(filesRef[which]));
+					StringBuilder sb = new StringBuilder();
+					String line;
+					while ((line = br.readLine()) != null) sb.append(line);
+					br.close();
+					org.json.JSONObject root = new org.json.JSONObject(sb.toString());
+					org.json.JSONArray arr = root.getJSONArray("bands");
+					boolean eqOn = root.optBoolean("eqEnabled", true);
+
+					// Мы уже на UI-потоке (setItems callback), runOnUiThread не нужен
+					synchronized (mEqLock) { mEqBands.clear(); }
+					if (mEqListView != null) mEqListView.removeAllViews();
+					for (int i = 0; i < arr.length(); i++) {
+						org.json.JSONObject obj = arr.getJSONObject(i);
+						EqBand b = new EqBand();
+						b.type    = obj.getInt("type");
+						b.enabled = obj.getBoolean("enabled");
+						b.freq    = (float) obj.getDouble("freq");
+						b.q       = (float) obj.getDouble("q");
+						b.gainDb  = (float) obj.getDouble("gainDb");
+						b.slopeDb = (float) obj.optDouble("slopeDb", 6.0);
+						synchronized (mEqLock) { b.computeCoeffs(AUDIO_SR); mEqBands.add(b); }
+						addEqBandRow(b);
+					}
+					mEqEnabled = eqOn;
+					if (mCbEqEnable != null) mCbEqEnable.setChecked(eqOn); // триггерит refresh()
+					else if (mEqOverlay != null) mEqOverlay.refresh();
+					status("EQ loaded: " + names[which]);
+				} catch (Exception ex) {
+					status("Load failed: " + ex.getMessage());
+				}
+			})
+			.setNegativeButton("Cancel", null)
+			.show();
+	}
+
 	private static final String P = "cam_prefs";
 	private void savePrefs() {
 		android.content.SharedPreferences.Editor e =
@@ -1837,9 +2027,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				addEqBandRow(b);
 			}
 		} catch (Exception ignored) {}
-	}
-
-	private void showAirplaneModeReminder() {
+		// Восстанавливаем оверлеи после загрузки всех настроек
+		updateNcOverlay();
+		if (mEqOverlay != null) mEqOverlay.refresh();
+	} {
 		new android.app.AlertDialog.Builder(this)
 			.setTitle("\u2708  Airplane Mode recommended")
 			.setMessage(
