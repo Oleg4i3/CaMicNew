@@ -1162,6 +1162,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
 		header.addView(tvTitle, tlp);
 
+		// 💾 / 📂 — в том же ряду, между заголовком и чекбоксом ON
+		Button btnSaveCfg = new Button(this);
+		btnSaveCfg.setText("💾");
+		btnSaveCfg.setTextSize(13);
+		btnSaveCfg.setBackground(null);
+		btnSaveCfg.setPadding(dp(4), 0, dp(2), 0);
+		btnSaveCfg.setOnClickListener(v -> saveEqConfig());
+		header.addView(btnSaveCfg);
+
+		Button btnLoadCfg = new Button(this);
+		btnLoadCfg.setText("📂");
+		btnLoadCfg.setTextSize(13);
+		btnLoadCfg.setBackground(null);
+		btnLoadCfg.setPadding(dp(2), 0, dp(6), 0);
+		btnLoadCfg.setOnClickListener(v -> loadEqConfig());
+		header.addView(btnLoadCfg);
+
 		mCbEqEnable = new CheckBox(this);
 		mCbEqEnable.setText("ON");
 		mCbEqEnable.setTextColor(0xCCCCCCCC);
@@ -1226,33 +1243,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		});
 		header.addView(btnClose);
 		panel.addView(header, new LinearLayout.LayoutParams(
-			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
-		// ── Строка Save / Load config ─────────────────────────────────────────
-		LinearLayout cfgRow = new LinearLayout(this);
-		cfgRow.setOrientation(LinearLayout.HORIZONTAL);
-		cfgRow.setGravity(Gravity.CENTER_VERTICAL);
-		cfgRow.setPadding(0, dp(3), 0, dp(3));
-
-		Button btnSaveCfg = new Button(this);
-		btnSaveCfg.setText("💾 Save config");
-		btnSaveCfg.setTextSize(11);
-		btnSaveCfg.setTextColor(0xFFAADDFF);
-		btnSaveCfg.setBackground(null);
-		btnSaveCfg.setPadding(dp(4), dp(2), dp(14), dp(2));
-		btnSaveCfg.setOnClickListener(v -> saveEqConfig());
-		cfgRow.addView(btnSaveCfg);
-
-		Button btnLoadCfg = new Button(this);
-		btnLoadCfg.setText("📂 Load config");
-		btnLoadCfg.setTextSize(11);
-		btnLoadCfg.setTextColor(0xFFAADDFF);
-		btnLoadCfg.setBackground(null);
-		btnLoadCfg.setPadding(dp(4), dp(2), dp(4), dp(2));
-		btnLoadCfg.setOnClickListener(v -> loadEqConfig());
-		cfgRow.addView(btnLoadCfg);
-
-		panel.addView(cfgRow, new LinearLayout.LayoutParams(
 			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
 		// Разделитель
@@ -1781,14 +1771,27 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	}
 
 	// =========================================================================
-	// EQ config save / load
+	// EQ config save / load  —  хранение в публичной папке Documents/CaMic
 	// =========================================================================
 
+	private static final String EQ_CFG_DIR = "Documents/CaMic";
+
 	/**
-	 * Сохраняет текущую цепочку EQ-фильтров в JSON-файл.
-	 * Показывает AlertDialog с полем ввода имени пресета.
-	 * Файлы хранятся в getExternalFilesDir(null) — доступны без рут,
-	 * видны при подключении USB (MTP).
+	 * Возвращает File-путь к Documents/CaMic (физический путь).
+	 * Используется для ЧТЕНИЯ (на API 29+ чтение из публичных папок через File работает).
+	 */
+	private java.io.File getEqConfigPublicDir() {
+		java.io.File docs = android.os.Environment
+			.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOCUMENTS);
+		java.io.File dir = new java.io.File(docs, "CaMic");
+		if (!dir.exists()) dir.mkdirs();
+		return dir;
+	}
+
+	/**
+	 * Сохраняет EQ-пресет через MediaStore → Documents/CaMic/<name>.json
+	 * Работает без WRITE_EXTERNAL_STORAGE на Android 10+ (API 29+).
+	 * На более старых версиях пишет напрямую через File.
 	 */
 	private void saveEqConfig() {
 		android.widget.EditText et = new android.widget.EditText(this);
@@ -1799,10 +1802,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			.setTitle("Save EQ config")
 			.setView(et)
 			.setPositiveButton("Save", (d, w) -> {
-				String name = et.getText().toString().trim();
-				if (name.isEmpty()) name = "eq_config";
-				// Убираем недопустимые символы для имени файла
-				name = name.replaceAll("[^a-zA-Z0-9_\\-]", "_");
+				String raw = et.getText().toString().trim();
+				if (raw.isEmpty()) raw = "eq_config";
+				final String name = raw.replaceAll("[^a-zA-Z0-9_\\-]", "_");
 				try {
 					org.json.JSONArray arr = new org.json.JSONArray();
 					synchronized (mEqLock) {
@@ -1820,14 +1822,38 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					org.json.JSONObject root = new org.json.JSONObject();
 					root.put("eqEnabled", mEqEnabled);
 					root.put("bands", arr);
-					java.io.File dir = getExternalFilesDir(null);
-					if (dir == null) dir = getFilesDir();
-					if (!dir.exists()) dir.mkdirs();
-					java.io.File f = new java.io.File(dir, name + ".json");
-					java.io.FileWriter fw = new java.io.FileWriter(f);
-					fw.write(root.toString(2));
-					fw.close();
-					status("EQ saved: " + f.getName());
+					String json = root.toString(2);
+					byte[] bytes = json.getBytes("UTF-8");
+
+					if (android.os.Build.VERSION.SDK_INT >= 29) {
+						// Android 10+: пишем через MediaStore без разрешений
+						String fileName = name + ".json";
+						android.content.ContentValues cv = new android.content.ContentValues();
+						cv.put(android.provider.MediaStore.Files.FileColumns.DISPLAY_NAME, fileName);
+						cv.put(android.provider.MediaStore.Files.FileColumns.MIME_TYPE, "application/json");
+						cv.put(android.provider.MediaStore.Files.FileColumns.RELATIVE_PATH, EQ_CFG_DIR);
+						// Удаляем старый файл с тем же именем если существует
+						android.net.Uri collection =
+							android.provider.MediaStore.Files.getContentUri("external");
+						String sel = android.provider.MediaStore.Files.FileColumns.DISPLAY_NAME
+							+ "=? AND " + android.provider.MediaStore.Files.FileColumns.RELATIVE_PATH
+							+ "=?";
+						getContentResolver().delete(collection, sel,
+							new String[]{fileName, EQ_CFG_DIR + "/"});
+						android.net.Uri uri = getContentResolver().insert(collection, cv);
+						if (uri == null) throw new Exception("MediaStore insert failed");
+						try (java.io.OutputStream os = getContentResolver().openOutputStream(uri)) {
+							if (os == null) throw new Exception("Cannot open output stream");
+							os.write(bytes);
+						}
+					} else {
+						// Android 9 и ниже: прямая запись через File
+						java.io.File f = new java.io.File(getEqConfigPublicDir(), name + ".json");
+						try (java.io.FileOutputStream fos = new java.io.FileOutputStream(f)) {
+							fos.write(bytes);
+						}
+					}
+					status("EQ saved → " + EQ_CFG_DIR + "/" + name + ".json");
 				} catch (Exception ex) {
 					status("Save failed: " + ex.getMessage());
 				}
@@ -1837,68 +1863,131 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	}
 
 	/**
-	 * Загружает цепочку EQ-фильтров из ранее сохранённого JSON-файла.
-	 * Показывает список .json файлов из getExternalFilesDir(null).
+	 * Загружает EQ-пресет из Documents/CaMic/*.json.
+	 * Читаем через прямой File-путь — чтение из публичных папок
+	 * работает без разрешений на всех версиях Android.
+	 */
+	/**
+	 * Загружает EQ-пресет из Documents/CaMic/*.json.
+	 * Android 10+: запрашиваем список через MediaStore (не нужны разрешения).
+	 * Android 9- : читаем напрямую через File.
 	 */
 	private void loadEqConfig() {
-		java.io.File dir = getExternalFilesDir(null);
-		if (dir == null) dir = getFilesDir();
-		java.io.File[] files = dir.listFiles((d, n) -> n.endsWith(".json"));
-		if (files == null || files.length == 0) {
+		if (Build.VERSION.SDK_INT >= 29) {
+			// ── Android 10+: список файлов через MediaStore ───────────────────
+			android.content.ContentResolver cr = getContentResolver();
+			android.net.Uri col = android.provider.MediaStore.Files.getContentUri("external");
+			String[] proj = {
+				android.provider.MediaStore.Files.FileColumns._ID,
+				android.provider.MediaStore.Files.FileColumns.DISPLAY_NAME,
+				android.provider.MediaStore.Files.FileColumns.DATE_MODIFIED
+			};
+			String sel = android.provider.MediaStore.Files.FileColumns.RELATIVE_PATH
+				+ " LIKE ? AND "
+				+ android.provider.MediaStore.Files.FileColumns.DISPLAY_NAME + " LIKE ?";
+
+			java.util.List<long[]> ids = new java.util.ArrayList<>();   // [_id, date_modified]
+			java.util.List<String> namesList = new java.util.ArrayList<>();
+			try (android.database.Cursor c = cr.query(col, proj, sel,
+					new String[]{EQ_CFG_DIR + "/", "%.json"},
+					android.provider.MediaStore.Files.FileColumns.DATE_MODIFIED + " DESC")) {
+				if (c != null) while (c.moveToNext()) {
+					long id  = c.getLong(0);
+					String nm = c.getString(1);
+					ids.add(new long[]{id});
+					namesList.add(nm.endsWith(".json") ? nm.substring(0, nm.length() - 5) : nm);
+				}
+			}
+			if (ids.isEmpty()) {
+				new android.app.AlertDialog.Builder(this)
+					.setTitle("Load EQ config")
+					.setMessage("No configs found in\n" + EQ_CFG_DIR + "\n\nSave a config first using 💾")
+					.setPositiveButton("OK", null).show();
+				return;
+			}
+			final java.util.List<long[]> idsRef = ids;
+			String[] names = namesList.toArray(new String[0]);
 			new android.app.AlertDialog.Builder(this)
 				.setTitle("Load EQ config")
-				.setMessage("No saved configs found.\nSave a config first using 💾 Save config.")
-				.setPositiveButton("OK", null)
-				.show();
-			return;
-		}
-		// Сортируем по дате изменения (новейший первый)
-		java.util.Arrays.sort(files, (a, b) -> Long.compare(b.lastModified(), a.lastModified()));
-		String[] names = new String[files.length];
-		for (int i = 0; i < files.length; i++) {
-			String n = files[i].getName();
-			names[i] = n.endsWith(".json") ? n.substring(0, n.length() - 5) : n;
-		}
-		final java.io.File[] filesRef = files;
-		new android.app.AlertDialog.Builder(this)
-			.setTitle("Load EQ config")
-			.setItems(names, (d, which) -> {
-				try {
-					java.io.BufferedReader br = new java.io.BufferedReader(
-						new java.io.FileReader(filesRef[which]));
-					StringBuilder sb = new StringBuilder();
-					String line;
-					while ((line = br.readLine()) != null) sb.append(line);
-					br.close();
-					org.json.JSONObject root = new org.json.JSONObject(sb.toString());
-					org.json.JSONArray arr = root.getJSONArray("bands");
-					boolean eqOn = root.optBoolean("eqEnabled", true);
-
-					// Мы уже на UI-потоке (setItems callback), runOnUiThread не нужен
-					synchronized (mEqLock) { mEqBands.clear(); }
-					if (mEqListView != null) mEqListView.removeAllViews();
-					for (int i = 0; i < arr.length(); i++) {
-						org.json.JSONObject obj = arr.getJSONObject(i);
-						EqBand b = new EqBand();
-						b.type    = obj.getInt("type");
-						b.enabled = obj.getBoolean("enabled");
-						b.freq    = (float) obj.getDouble("freq");
-						b.q       = (float) obj.getDouble("q");
-						b.gainDb  = (float) obj.getDouble("gainDb");
-						b.slopeDb = (float) obj.optDouble("slopeDb", 6.0);
-						synchronized (mEqLock) { b.computeCoeffs(AUDIO_SR); mEqBands.add(b); }
-						addEqBandRow(b);
+				.setItems(names, (d, which) -> {
+					try {
+						android.net.Uri fileUri = android.net.Uri.withAppendedPath(col,
+							String.valueOf(idsRef.get(which)[0]));
+						StringBuilder sb = new StringBuilder();
+						try (java.io.InputStream is = cr.openInputStream(fileUri);
+							 java.io.BufferedReader br = new java.io.BufferedReader(
+								new java.io.InputStreamReader(is,
+									java.nio.charset.StandardCharsets.UTF_8))) {
+							String line;
+							while ((line = br.readLine()) != null) sb.append(line);
+						}
+						applyEqJson(sb.toString());
+						status("EQ loaded: " + names[which]);
+					} catch (Exception ex) {
+						status("Load failed: " + ex.getMessage());
 					}
-					mEqEnabled = eqOn;
-					if (mCbEqEnable != null) mCbEqEnable.setChecked(eqOn); // триггерит refresh()
-					else if (mEqOverlay != null) mEqOverlay.refresh();
-					status("EQ loaded: " + names[which]);
-				} catch (Exception ex) {
-					status("Load failed: " + ex.getMessage());
-				}
-			})
-			.setNegativeButton("Cancel", null)
-			.show();
+				})
+				.setNegativeButton("Cancel", null).show();
+		} else {
+			// ── Android 9 и ниже: прямой доступ через File ───────────────────
+			java.io.File dir = getEqConfigPublicDir();
+			java.io.File[] files = dir.listFiles((d, n) -> n.endsWith(".json"));
+			if (files == null || files.length == 0) {
+				new android.app.AlertDialog.Builder(this)
+					.setTitle("Load EQ config")
+					.setMessage("No configs found in\n" + EQ_CFG_DIR + "\n\nSave a config first using 💾")
+					.setPositiveButton("OK", null).show();
+				return;
+			}
+			java.util.Arrays.sort(files, (a, b) -> Long.compare(b.lastModified(), a.lastModified()));
+			String[] names = new String[files.length];
+			for (int i = 0; i < files.length; i++) {
+				String n = files[i].getName();
+				names[i] = n.endsWith(".json") ? n.substring(0, n.length() - 5) : n;
+			}
+			final java.io.File[] filesRef = files;
+			new android.app.AlertDialog.Builder(this)
+				.setTitle("Load EQ config")
+				.setItems(names, (d, which) -> {
+					try {
+						StringBuilder sb = new StringBuilder();
+						try (java.io.BufferedReader br = new java.io.BufferedReader(
+								new java.io.FileReader(filesRef[which]))) {
+							String line;
+							while ((line = br.readLine()) != null) sb.append(line);
+						}
+						applyEqJson(sb.toString());
+						status("EQ loaded: " + names[which]);
+					} catch (Exception ex) {
+						status("Load failed: " + ex.getMessage());
+					}
+				})
+				.setNegativeButton("Cancel", null).show();
+		}
+	}
+
+	/** Применяет JSON-строку пресета к текущему EQ. */
+	private void applyEqJson(String json) throws org.json.JSONException {
+		org.json.JSONObject root = new org.json.JSONObject(json);
+		org.json.JSONArray arr = root.getJSONArray("bands");
+		boolean eqOn = root.optBoolean("eqEnabled", true);
+		synchronized (mEqLock) { mEqBands.clear(); }
+		if (mEqListView != null) mEqListView.removeAllViews();
+		for (int i = 0; i < arr.length(); i++) {
+			org.json.JSONObject obj = arr.getJSONObject(i);
+			EqBand b = new EqBand();
+			b.type    = obj.getInt("type");
+			b.enabled = obj.getBoolean("enabled");
+			b.freq    = (float) obj.getDouble("freq");
+			b.q       = (float) obj.getDouble("q");
+			b.gainDb  = (float) obj.getDouble("gainDb");
+			b.slopeDb = (float) obj.optDouble("slopeDb", 6.0);
+			synchronized (mEqLock) { b.computeCoeffs(AUDIO_SR); mEqBands.add(b); }
+			addEqBandRow(b);
+		}
+		mEqEnabled = eqOn;
+		if (mCbEqEnable != null) mCbEqEnable.setChecked(eqOn);
+		else if (mEqOverlay != null) mEqOverlay.refresh();
 	}
 
 	private static final String P = "cam_prefs";
